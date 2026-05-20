@@ -148,7 +148,22 @@ def evaluate_single_fold(config, dataset, labels, fold, test_idx):
     )
 
     model = Transformer(config).to(config.device)
-    model.load_state_dict(torch.load(path_model, map_location=config.device), strict=True)
+    load_result = model.load_state_dict(torch.load(path_model, map_location=config.device), strict=False)
+    allowed_missing = {'modality_fuse.weight', 'modality_fuse.bias'}
+    unexpected = set(load_result.unexpected_keys)
+    missing = set(load_result.missing_keys)
+    if unexpected or (missing - allowed_missing):
+        raise RuntimeError(
+            f'[ERROR] Checkpoint mismatch. missing={load_result.missing_keys}, '
+            f'unexpected={load_result.unexpected_keys}'
+        )
+    if missing and dataset.dim() == 5:
+        raise RuntimeError(
+            '[ERROR] This checkpoint is frequency-only but the loaded dataset includes TIME data. '
+            'Call data_generator(..., use_time=False) or remove TIME files for frequency-only evaluation.'
+        )
+    if missing:
+        print(f'[INFO] Loaded frequency-only checkpoint without new modality fusion weights: {sorted(missing)}')
 
     result = test(model, test_loader, config)
 
@@ -161,7 +176,8 @@ def evaluate_single_fold(config, dataset, labels, fold, test_idx):
 def evaluate(config, path):
     dataset, labels, _ = data_generator(
         path_labels=path.path_labels,
-        path_dataset=path.path_TF
+        path_dataset=path.path_TF,
+        use_time=config.use_time
     )
 
     kf = StratifiedKFold(n_splits=config.num_fold, shuffle=True, random_state=0)
@@ -228,6 +244,7 @@ def evaluate(config, path):
 if __name__ == '__main__':
     config = Config()
     path = Path()
+    print(f'[INFO] use_time = {config.use_time}')
 
     ACC, Kappa, MF1, WF1, Sens, Spec, Bal_ACC, Confusion_mat, class_wise_result, valid_folds = evaluate(config, path)
 

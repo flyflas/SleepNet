@@ -8,6 +8,9 @@ from sklearn.model_selection import train_test_split
 from args import Config
 
 
+_DEFAULT_USE_TIME = object()
+
+
 def print_label_distribution(labels, split_name='labels'):
     """Print label distribution."""
     if isinstance(labels, torch.Tensor):
@@ -23,7 +26,47 @@ def print_label_distribution(labels, split_name='labels'):
         print(f'  class {u}: {c} ({c / total:.6f})')
 
 
-def data_generator(path_labels, path_dataset):
+def _load_channel_arrays(path_dataset, prefix):
+    arrays = []
+    for channel in ['EEG_Fpz-Cz', 'EEG_Pz-Oz', 'EOG']:
+        file_path = os.path.join(path_dataset, f'{prefix}_{channel}_mean_std.npy')
+        arrays.append(np.load(file_path).astype('float32'))
+    return arrays
+
+
+def _check_channel_shapes(arrays, prefix):
+    expected_shape = arrays[0].shape
+    if expected_shape[1:] != (29, 128):
+        raise ValueError(
+            f'[ERROR] {prefix} channel shape must be [N, 29, 128], got {expected_shape}'
+        )
+
+    for idx, array in enumerate(arrays[1:], start=1):
+        if array.shape != expected_shape:
+            raise ValueError(
+                f'[ERROR] {prefix} channel {idx} shape {array.shape} != first channel shape {expected_shape}'
+            )
+
+
+def _time_file_status(path_dataset):
+    expected_files = [
+        os.path.join(path_dataset, f'TIME_{channel}_mean_std.npy')
+        for channel in ['EEG_Fpz-Cz', 'EEG_Pz-Oz', 'EOG']
+    ]
+    existing_files = [file_path for file_path in expected_files if os.path.exists(file_path)]
+    missing_files = [file_path for file_path in expected_files if not os.path.exists(file_path)]
+    return existing_files, missing_files
+
+
+def data_generator(path_labels, path_dataset, use_time=_DEFAULT_USE_TIME):
+    """
+    Build dataset tensors.
+
+    Omitted use_time preserves the frequency-only baseline [N, 3, 29, 128].
+    use_time=False explicitly preserves the frequency-only baseline [N, 3, 29, 128].
+    use_time=True requires TIME files and returns [N, 3, 2, 29, 128].
+    use_time=None auto-enables freq+time data when all TIME files exist.
+    """
     config = Config()
 
     # 1. 一定要排序，保证和 data_preprocess_TF.py 的拼接顺序一致
@@ -43,20 +86,50 @@ def data_generator(path_labels, path_dataset):
     labels = torch.from_numpy(labels)
 
     # 3. 读取三个通道的 TF 数据
-    dataset_EEG_FpzCz = np.load(
-        os.path.join(path_dataset, 'TF_EEG_Fpz-Cz_mean_std.npy')
-    ).astype('float32')
+    freq_arrays = _load_channel_arrays(path_dataset, prefix='TF')
+    _check_channel_shapes(freq_arrays, prefix='TF')
+    freq_dataset = np.stack(freq_arrays, axis=1)
 
-    dataset_EEG_PzOz = np.load(
-        os.path.join(path_dataset, 'TF_EEG_Pz-Oz_mean_std.npy')
-    ).astype('float32')
+    existing_time_files, missing_time_files = _time_file_status(path_dataset)
+    has_any_time = bool(existing_time_files)
+    has_all_time = not missing_time_files
+    use_time_was_omitted = use_time is _DEFAULT_USE_TIME
+    if use_time_was_omitted:
+        if has_any_time and not has_all_time:
+            raise FileNotFoundError(
+                '[ERROR] use_time was omitted and partial TIME files were found. '
+                'Pass use_time=False for frequency-only data or provide all TIME files. '
+                f'missing={missing_time_files}'
+            )
+        use_time = False
+    elif use_time is None:
+        if has_any_time and not has_all_time:
+            raise FileNotFoundError(
+                '[ERROR] use_time=None auto mode found partial TIME files. '
+                f'missing={missing_time_files}'
+            )
+        use_time = has_all_time
+    elif use_time and not has_all_time:
+        raise FileNotFoundError(
+            '[ERROR] use_time=True but one or more TIME_*_mean_std.npy files are missing. '
+            f'missing={missing_time_files}'
+        )
 
-    dataset_EOG = np.load(
-        os.path.join(path_dataset, 'TF_EOG_mean_std.npy')
-    ).astype('float32')
+    # 4. 堆叠成 [N, 3, 29, 128] 或 [N, 3, 2, 29, 128]
+    if use_time:
+        time_arrays = _load_channel_arrays(path_dataset, prefix='TIME')
+        _check_channel_shapes(time_arrays, prefix='TIME')
+        time_dataset = np.stack(time_arrays, axis=1)
 
-    # 4. 堆叠成 [N, 3, 29, 128]
-    dataset = np.stack((dataset_EEG_FpzCz, dataset_EEG_PzOz, dataset_EOG), axis=1)
+        if time_dataset.shape != freq_dataset.shape:
+            raise ValueError(
+                f'[ERROR] time dataset shape {time_dataset.shape} != freq dataset shape {freq_dataset.shape}'
+            )
+
+        dataset = np.stack((freq_dataset, time_dataset), axis=2)
+    else:
+        dataset = freq_dataset
+
     dataset = torch.from_numpy(dataset)
 
     print(f'[INFO] dataset shape: {dataset.shape}')
@@ -105,5 +178,3 @@ if __name__ == '__main__':
 
     path = Path()
     data_generator(path_labels=path.path_labels, path_dataset=path.path_TF)
-
-

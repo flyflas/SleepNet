@@ -169,10 +169,12 @@ def train(save_all_checkpoint=False, start_fold=None):
     print(f'[INFO] batch_size = {config.batch_size}')
     print(f'[INFO] learning_rate = {config.learning_rate}')
     print(f'[INFO] num_epochs = {config.num_epochs}')
+    print(f'[INFO] use_time = {config.use_time}')
 
     dataset, labels, val_loader = data_generator(
         path_labels=path.path_labels,
-        path_dataset=path.path_TF
+        path_dataset=path.path_TF,
+        use_time=config.use_time
     )
 
     print(f'[INFO] dataset shape: {dataset.shape}')

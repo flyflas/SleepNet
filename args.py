@@ -37,6 +37,7 @@ class Config(object):
 
         # dataloader
         self.num_workers = 12
+        self.use_time = False
 
         # scheduler / early stop
         self.scheduler_factor = 0.5

@@ -132,7 +132,7 @@ def spectrogram(x, window, n_overlap, nfft):
     return spectrogram_data
 
 
-def data_normalize(dataset, channel, save_dir):
+def data_normalize(dataset, channel, save_dir, prefix='TF'):
     """Normalize datasets of each channel to zero mean and unit variance."""
     print(f'[INFO] Checking inf values before normalization for channel={channel} ...')
     for i in tqdm(range(dataset.shape[0])):
@@ -159,13 +159,34 @@ def data_normalize(dataset, channel, save_dir):
     has_inf = np.any(np.isinf(dataset))
     has_nan = np.any(np.isnan(dataset))
 
-    save_path = os.path.join(save_dir, f'TF_{channel}_mean_std.npy')
+    save_path = os.path.join(save_dir, f'{prefix}_{channel}_mean_std.npy')
     if (not has_inf) and (not has_nan):
         np.save(save_path, dataset)
         print(f'[INFO] Saved {save_path}, shape={dataset.shape}')
         print(f'[INFO] After normalization: mean={np.mean(dataset):.6f}, std={np.std(dataset):.6f}')
     else:
         print(f'[ERROR] {channel} still contains inf or nan, not saved.')
+
+
+def interpolate_time_windows(epoch, window=200, step=100, target_len=128, num_windows=29):
+    """Slice one raw epoch with STFT-aligned windows and resample each window."""
+    if epoch.shape[0] != 3000:
+        raise ValueError(f'[ERROR] Expected raw epoch length 3000, got {epoch.shape[0]}')
+
+    x_old = np.linspace(0, window - 1, window)
+    x_new = np.linspace(0, window - 1, target_len)
+    windows = np.zeros((num_windows, target_len), dtype=np.float32)
+
+    for i in range(num_windows):
+        start = i * step
+        subdata = epoch[start:start + window]
+        if subdata.shape[0] != window:
+            raise ValueError(
+                f'[ERROR] Window {i} has length {subdata.shape[0]}, expected {window}'
+            )
+        windows[i] = np.interp(x_new, x_old, subdata).astype(np.float32)
+
+    return windows
 
 
 if __name__ == '__main__':
@@ -182,12 +203,13 @@ if __name__ == '__main__':
     # 2. 检查 labels 总体分布
     check_label_distribution(os.path.join(path.path_raw_data, 'labels'))
 
-    # 3. 处理三个通道的 TF 图
+    # 3. 处理三个通道的 TF 图和对齐的时域插值窗口
     for channel in ['EEG_Fpz-Cz', 'EEG_Pz-Oz', 'EOG']:
         print('\n' + '-' * 15, f'Processing channel: {channel}', '-' * 15)
 
         data_channel = data_array_concat(path_array=os.path.join(path.path_raw_data, channel))
         X = np.zeros([data_channel.shape[0], 29, int(nfft / 2)], dtype=np.float32)
+        X_time = np.zeros([data_channel.shape[0], 29, 128], dtype=np.float32)
 
         print('Transform to TF images:')
         for i in tqdm(range(data_channel.shape[0])):
@@ -196,6 +218,19 @@ if __name__ == '__main__':
             X[i, :, :] = Xi[:, 1:129]
 
         print(f'[INFO] TF image shape for {channel}: {X.shape}')
-        print('Normalize:')
-        data_normalize(dataset=X, channel=channel, save_dir=path.path_TF)
+        print('Normalize TF:')
+        data_normalize(dataset=X, channel=channel, save_dir=path.path_TF, prefix='TF')
 
+        print('Transform to time-domain interpolation windows:')
+        for i in tqdm(range(data_channel.shape[0])):
+            X_time[i] = interpolate_time_windows(
+                data_channel[i, :],
+                window=win_size * fs,
+                step=(win_size - overlap) * fs,
+                target_len=128,
+                num_windows=29
+            )
+
+        print(f'[INFO] TIME image shape for {channel}: {X_time.shape}')
+        print('Normalize TIME:')
+        data_normalize(dataset=X_time, channel=channel, save_dir=path.path_TF, prefix='TIME')

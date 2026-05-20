@@ -56,8 +56,14 @@ class Transformer(nn.Module):
     def __init__(self, config):
         super().__init__()
 
+        self.num_channels = 3
+        self.num_modalities = 2
+        self.pad_size = config.pad_size
+        self.dim_model = config.dim_model
+
         self.position_single = PositionalEncoding(config.dim_model, 0.1, config.pad_size + 1)
         self.position_multi = PositionalEncoding(config.dim_model * 3, 0.1, config.pad_size + 1)
+        self.modality_fuse = nn.Linear(config.dim_model * 2, config.dim_model)
 
         encoder_layer_1 = nn.TransformerEncoderLayer(
             d_model=config.dim_model,
@@ -111,7 +117,45 @@ class Transformer(nn.Module):
         )
         self.fc2 = nn.Linear(config.fc_hidden, config.num_classes)
 
+    def _prepare_input(self, x):
+        if x.dim() == 4:
+            if (
+                x.size(1) != self.num_channels
+                or x.size(2) != self.pad_size
+                or x.size(3) != self.dim_model
+            ):
+                raise ValueError(
+                    f'Frequency-only input must have shape '
+                    f'[B, {self.num_channels}, {self.pad_size}, {self.dim_model}], got {tuple(x.shape)}'
+                )
+            return x
+
+        if x.dim() == 5:
+            if (
+                x.size(1) != self.num_channels
+                or x.size(2) != self.num_modalities
+                or x.size(3) != self.pad_size
+                or x.size(4) != self.dim_model
+            ):
+                raise ValueError(
+                    f'Freq/time input must have shape '
+                    f'[B, {self.num_channels}, {self.num_modalities}, {self.pad_size}, {self.dim_model}], '
+                    f'got {tuple(x.shape)}'
+                )
+
+            freq = x[:, :, 0]
+            time = x[:, :, 1]
+            return self.modality_fuse(torch.cat([freq, time], dim=-1))
+
+        raise ValueError(
+            f'Input must be rank 4 [B, {self.num_channels}, {self.pad_size}, {self.dim_model}] '
+            f'or rank 5 [B, {self.num_channels}, {self.num_modalities}, {self.pad_size}, {self.dim_model}], '
+            f'got rank {x.dim()}'
+        )
+
     def forward(self, x):
+        x = self._prepare_input(x)
+
         x1 = x[:, 0]
         x2 = x[:, 1]
         x3 = x[:, 2]
