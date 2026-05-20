@@ -22,13 +22,11 @@ def set_random_seed(seed=0):
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
-    # 为了结果更稳定，先关闭 benchmark
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
 
 def print_label_distribution(labels, split_name='dataset'):
-    """Print label distribution of a numpy array or torch tensor."""
     if isinstance(labels, torch.Tensor):
         labels = labels.cpu().numpy()
 
@@ -41,7 +39,6 @@ def print_label_distribution(labels, split_name='dataset'):
 
 
 def build_dataloader(dataset, batch_size, shuffle, num_workers=8):
-    """Build DataLoader with safer worker settings."""
     return DataLoader(
         dataset=dataset,
         batch_size=batch_size,
@@ -54,11 +51,6 @@ def build_dataloader(dataset, batch_size, shuffle, num_workers=8):
 
 
 def evaluate(model, loader, criterion, config, split_name='eval', print_distribution=False):
-    """
-    Evaluate model on a dataloader.
-    Returns:
-        accuracy, avg_loss
-    """
     model.eval()
 
     all_preds = []
@@ -101,7 +93,36 @@ def evaluate(model, loader, criterion, config, split_name='eval', print_distribu
     return accuracy, avg_loss
 
 
-def train(save_all_checkpoint=False):
+def is_fold_finished(fold_dir: str) -> bool:
+    """
+    判定某个 fold 是否已经完整跑完。
+    你当前 trainer 在 fold 结束后会保存这些 npy 文件，
+    所以这些文件都存在时，就认为这个 fold 已完成。
+    """
+    required_files = [
+        'train_LOSS.npy',
+        'train_ACC.npy',
+        'test_LOSS.npy',
+        'test_ACC.npy',
+        'val_LOSS.npy',
+        'val_ACC.npy',
+    ]
+    return all(os.path.exists(os.path.join(fold_dir, f)) for f in required_files)
+
+
+def find_first_unfinished_fold(num_fold: int, root='./Kfold_models') -> int:
+    """
+    自动找到第一个未完成的 fold。
+    如果都完成了，返回 num_fold。
+    """
+    for fold in range(num_fold):
+        fold_dir = os.path.join(root, f'fold{fold}')
+        if not is_fold_finished(fold_dir):
+            return fold
+    return num_fold
+
+
+def train(save_all_checkpoint=False, start_fold=None):
     config = Config()
     path = Path()
 
@@ -110,7 +131,6 @@ def train(save_all_checkpoint=False):
     print(f'[INFO] learning_rate = {config.learning_rate}')
     print(f'[INFO] num_epochs = {config.num_epochs}')
 
-    # 保持你当前项目的调用方式
     dataset, labels, val_loader = data_generator(
         path_labels=path.path_labels,
         path_dataset=path.path_TF
@@ -126,11 +146,33 @@ def train(save_all_checkpoint=False):
         random_state=0
     )
 
-    for fold, (train_idx, test_idx) in enumerate(kf.split(dataset, labels)):
-        print('\n' + '-' * 15 + f' > Fold {fold} < ' + '-' * 15)
+    # 自动找未完成 fold
+    auto_start_fold = find_first_unfinished_fold(config.num_fold, root='./Kfold_models')
 
+    if start_fold is None:
+        start_fold = auto_start_fold
+
+    print(f'[INFO] resume start fold = {start_fold}')
+
+    if start_fold >= config.num_fold:
+        print('[INFO] All folds are already finished. Nothing to do.')
+        return
+
+    for fold, (train_idx, test_idx) in enumerate(kf.split(dataset, labels)):
         fold_dir = f'./Kfold_models/fold{fold}'
         os.makedirs(fold_dir, exist_ok=True)
+
+        # 1) 小于 start_fold 的一律跳过
+        if fold < start_fold:
+            print(f'[INFO] Skip fold {fold} (before start_fold={start_fold}).')
+            continue
+
+        # 2) 如果该 fold 已完整完成，也跳过
+        if is_fold_finished(fold_dir):
+            print(f'[INFO] Skip fold {fold} (already finished).')
+            continue
+
+        print('\n' + '-' * 15 + f' > Fold {fold} < ' + '-' * 15)
 
         X_train, X_test = dataset[train_idx], dataset[test_idx]
         y_train, y_test = labels[train_idx], labels[test_idx]
@@ -160,7 +202,6 @@ def train(save_all_checkpoint=False):
         model = Transformer(config).to(config.device)
         criterion = nn.CrossEntropyLoss()
 
-        # 保持你目前的优化器设置
         optimizer = optim.AdamW(
             model.parameters(),
             lr=config.learning_rate,
@@ -216,7 +257,6 @@ def train(save_all_checkpoint=False):
             train_loss = total_train_loss / total_train_samples
             train_acc = total_train_correct / total_train_samples
 
-            # 只在前 3 个 epoch 和每 10 个 epoch 打印一次分布，避免日志太长
             need_print_dist = (epoch < 3) or (epoch % 10 == 0)
 
             test_acc, test_loss = evaluate(
@@ -250,7 +290,6 @@ def train(save_all_checkpoint=False):
             val_ACC.append(val_acc)
             val_LOSS.append(val_loss)
 
-            # 保持你当前早停调用方式
             model_path = os.path.join(fold_dir, f'model_{fold}_epoch{epoch}.pkl')
             early_stopping(val_acc, model, path=model_path)
 
@@ -271,7 +310,4 @@ def train(save_all_checkpoint=False):
 
 if __name__ == '__main__':
     set_random_seed(0)
-    train(save_all_checkpoint=False)
-    
-    
-
+    train(save_all_checkpoint=False, start_fold=None)
