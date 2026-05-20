@@ -1,0 +1,42 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.pyo
+*.so
+*.egg-info/
+*.egg
+dist/
+build/
+
+# --- 训练输出产物 ---
+output/
+Kfold_models/
+Kfold_models_transformer_cross_b/
+Kfold_models_transformer_cross_min/
+
+# --- 预处理数据（可以重新生成） ---
+data/
+
+# --- IDE / Editor ---
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# --- OS ---
+.DS_Store
+Thumbs.db
+
+# --- Jupyter ---
+.ipynb_checkpoints/
+
+# --- 大文件 ---
+*.zip
+*.tar
+*.gz
+
+# --- 环境 / 凭据 ---
+.env
+venv/
+.venv/
