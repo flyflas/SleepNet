@@ -55,7 +55,7 @@ class Config(object):
 class Path(object):
     """path of files in this project"""
     def __init__(self):
-        old_root = '/openbayes/home/MultiChannelSleepNet'
+        old_root = '/openbayes/input/input0'
 
         self.path_PSG = os.path.join(old_root, 'dataset/sleepEDF-78/sleep-cassette')
         self.path_hypnogram = os.path.join(old_root, 'dataset/sleepEDF-78/Hypnogram')
