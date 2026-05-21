@@ -40,3 +40,11 @@ Thumbs.db
 .env
 venv/
 .venv/
+
+# --- UV / local dependency cache ---
+uv.lock
+.uv-cache/
+
+# --- Local MLflow smoke tests ---
+.mlflow-smoke/
+mlflow_smoke_test.py
