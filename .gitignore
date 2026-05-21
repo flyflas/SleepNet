@@ -16,6 +16,7 @@ Kfold_models_transformer_cross_min/
 
 # --- 预处理数据（可以重新生成） ---
 data/
+dataset/
 
 # --- IDE / Editor ---
 .vscode/
