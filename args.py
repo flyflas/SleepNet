@@ -23,6 +23,14 @@ class Config(object):
         self.num_head = 8
         self.num_encoder = 16
         self.num_encoder_multi = 4
+        self.model_name = 'transformer_epoch_context'
+
+        # epoch-level context encoder settings
+        self.context_num_head = 8
+        self.context_num_encoder = 2
+        self.context_forward_hidden = 1024
+        self.context_dropout = 0.1
+        self.context_use_local_center_concat = True
 
         # mamba settings
         self.use_positional_encoding = False
@@ -39,6 +47,15 @@ class Config(object):
         self.num_workers = 12
         self.use_time = False
 
+        # context window settings
+        self.context_left = 2
+        self.context_right = 2
+        self.context_length = self.context_left + 1 + self.context_right
+        self.context_center_index = self.context_left
+        self.split_group_policy = 'subject'
+        self.subject_id_length = 6
+        self.validation_group_fraction = 1 / (self.num_fold + 1)
+
         # scheduler / early stop
         self.scheduler_factor = 0.5
         self.scheduler_patience = 3
@@ -51,14 +68,34 @@ class Config(object):
         self.print_distribution_first_n_epochs = 3
         self.print_distribution_every = 10
 
+        self._validate_context_config()
+
+    def _validate_context_config(self):
+        if self.context_left < 0 or self.context_right < 0:
+            raise ValueError('[ERROR] context_left/context_right must be non-negative')
+        if self.context_left != self.context_right:
+            raise ValueError('[ERROR] Phase 1 requires symmetric bidirectional context windows')
+        expected_length = self.context_left + 1 + self.context_right
+        if self.context_length != expected_length:
+            raise ValueError(
+                f'[ERROR] context_length={self.context_length} must equal '
+                f'context_left + 1 + context_right = {expected_length}'
+            )
+        if self.context_center_index != self.context_left:
+            raise ValueError('[ERROR] context_center_index must equal context_left')
+        if self.split_group_policy not in ('subject', 'record'):
+            raise ValueError('[ERROR] split_group_policy must be "subject" or "record"')
+        if not 0 < self.validation_group_fraction < 1:
+            raise ValueError('[ERROR] validation_group_fraction must be between 0 and 1')
+
 
 class Path(object):
     """path of files in this project"""
     def __init__(self):
-        old_root = '/openbayes/input/input0'
+        old_root = '/Users/xiaobai/Documents/model'
 
-        self.path_PSG = os.path.join(old_root, 'dataset/sleepEDF-78/sleep-cassette')
-        self.path_hypnogram = os.path.join(old_root, 'dataset/sleepEDF-78/Hypnogram')
+        self.path_PSG = os.path.join(old_root, 'dataset/Sleep-EDF-78/sleep-edfx/sleep-cassette')
+        self.path_hypnogram = os.path.join(old_root, 'dataset/Sleep-EDF-78/sleep-edfx/Hypnogram')
         self.path_raw_data = os.path.join(old_root, 'data/sleepEDF-78/data_array/raw_data')
         self.path_labels = os.path.join(old_root, 'data/sleepEDF-78/data_array/raw_data/labels')
         self.path_TF = os.path.join(old_root, 'data/sleepEDF-78/data_array/TF_data')

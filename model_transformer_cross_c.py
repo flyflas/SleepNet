@@ -60,9 +60,18 @@ class Transformer(nn.Module):
         self.num_modalities = 2
         self.pad_size = config.pad_size
         self.dim_model = config.dim_model
+        self.context_length = config.context_length
+        self.context_center_index = config.context_center_index
+        self.epoch_embedding_dim = config.fc_hidden
+        self.use_local_center_concat = config.context_use_local_center_concat
 
         self.position_single = PositionalEncoding(config.dim_model, 0.1, config.pad_size + 1)
         self.position_multi = PositionalEncoding(config.dim_model * 3, 0.1, config.pad_size + 1)
+        self.position_context = PositionalEncoding(
+            config.fc_hidden,
+            config.context_dropout,
+            config.context_length + 1
+        )
         self.modality_fuse = nn.Linear(config.dim_model * 2, config.dim_model)
 
         encoder_layer_1 = nn.TransformerEncoderLayer(
@@ -115,7 +124,20 @@ class Transformer(nn.Module):
             nn.ReLU(),
             nn.Dropout(0.5)
         )
-        self.fc2 = nn.Linear(config.fc_hidden, config.num_classes)
+        context_layer = nn.TransformerEncoderLayer(
+            d_model=config.fc_hidden,
+            nhead=config.context_num_head,
+            dim_feedforward=config.context_forward_hidden,
+            dropout=config.context_dropout,
+            batch_first=True
+        )
+        self.context_encoder = nn.TransformerEncoder(
+            context_layer,
+            num_layers=config.context_num_encoder
+        )
+
+        classifier_input_dim = config.fc_hidden * 2 if self.use_local_center_concat else config.fc_hidden
+        self.classifier = nn.Linear(classifier_input_dim, config.num_classes)
 
     def _prepare_input(self, x):
         if x.dim() == 4:
@@ -153,7 +175,59 @@ class Transformer(nn.Module):
             f'got rank {x.dim()}'
         )
 
-    def forward(self, x):
+    def _prepare_context_input(self, x):
+        if x.dim() == 5:
+            if (
+                x.size(1) == self.num_channels
+                and x.size(2) == self.num_modalities
+                and x.size(3) == self.pad_size
+                and x.size(4) == self.dim_model
+            ):
+                raise ValueError(
+                    f'Transformer.forward no longer accepts single-epoch freq/time input '
+                    f'[B, {self.num_channels}, {self.num_modalities}, {self.pad_size}, {self.dim_model}]. '
+                    f'Use encode_epoch() for embeddings or pass context input '
+                    f'[B, {self.context_length}, {self.num_channels}, {self.num_modalities}, '
+                    f'{self.pad_size}, {self.dim_model}].'
+                )
+            if (
+                x.size(1) != self.context_length
+                or x.size(2) != self.num_channels
+                or x.size(3) != self.pad_size
+                or x.size(4) != self.dim_model
+            ):
+                raise ValueError(
+                    f'Frequency-only context input must have shape '
+                    f'[B, {self.context_length}, {self.num_channels}, {self.pad_size}, {self.dim_model}], '
+                    f'got {tuple(x.shape)}'
+                )
+            return x
+
+        if x.dim() == 6:
+            if (
+                x.size(1) != self.context_length
+                or x.size(2) != self.num_channels
+                or x.size(3) != self.num_modalities
+                or x.size(4) != self.pad_size
+                or x.size(5) != self.dim_model
+            ):
+                raise ValueError(
+                    f'Freq/time context input must have shape '
+                    f'[B, {self.context_length}, {self.num_channels}, {self.num_modalities}, '
+                    f'{self.pad_size}, {self.dim_model}], got {tuple(x.shape)}'
+                )
+            return x
+
+        raise ValueError(
+            f'Transformer.forward expects context input rank 5 '
+            f'[B, {self.context_length}, {self.num_channels}, {self.pad_size}, {self.dim_model}] '
+            f'or rank 6 [B, {self.context_length}, {self.num_channels}, {self.num_modalities}, '
+            f'{self.pad_size}, {self.dim_model}]. '
+            f'Single-epoch rank 4/5 inputs are only supported through encode_epoch(), got rank {x.dim()}'
+        )
+
+    def encode_epoch(self, x):
+        """Encode independent epochs to embeddings without producing logits."""
         x = self._prepare_input(x)
 
         x1 = x[:, 0]
@@ -186,5 +260,27 @@ class Transformer(nn.Module):
 
         x = x.contiguous().view(x.size(0), -1)
         x = self.fc1(x)
-        x = self.fc2(x)
         return x
+
+    def forward(self, x):
+        x = self._prepare_context_input(x)
+
+        batch_size = x.size(0)
+        context_length = x.size(1)
+        epoch_shape = x.shape[2:]
+        epoch_inputs = x.contiguous().view(batch_size * context_length, *epoch_shape)
+        epoch_embeddings = self.encode_epoch(epoch_inputs).view(
+            batch_size,
+            context_length,
+            self.epoch_embedding_dim
+        )
+
+        context_features = self.position_context(epoch_embeddings)
+        context_features = self.context_encoder(context_features)
+
+        center_context = context_features[:, self.context_center_index]
+        if self.use_local_center_concat:
+            center_local = epoch_embeddings[:, self.context_center_index]
+            center_context = torch.cat([center_local, center_context], dim=-1)
+
+        return self.classifier(center_context)

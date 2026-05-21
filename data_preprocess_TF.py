@@ -111,6 +111,66 @@ def data_array_concat(path_array):
     return data_channel
 
 
+def load_record_raw_arrays(path_array, channel):
+    """Load raw channel arrays as ordered per-record sequences."""
+    file_list = get_npy_file_list(path_array)
+    record_arrays = []
+
+    print(f'Preparing per-record dataset from: {path_array}')
+    for f in tqdm(file_list):
+        data = np.load(os.path.join(path_array, f)).astype('float32')
+        if data.ndim == 3 and data.shape[1] == 1:
+            data = np.squeeze(data, axis=1)
+        if data.ndim != 2:
+            raise ValueError(f'[ERROR] Expected raw record shape [T, 3000], got {data.shape} for {f}')
+        record_id = strip_suffix(f, channel)
+        record_arrays.append((record_id, data))
+
+    return record_arrays
+
+
+def transform_record_arrays(record_arrays, fs, win_size, overlap, nfft):
+    """Create TF and STFT-aligned time windows while preserving record boundaries."""
+    tf_records = []
+    time_records = []
+
+    for record_id, data in tqdm(record_arrays, desc='Transform records'):
+        X = np.zeros([data.shape[0], 29, int(nfft / 2)], dtype=np.float32)
+        X_time = np.zeros([data.shape[0], 29, 128], dtype=np.float32)
+
+        for i in range(data.shape[0]):
+            Xi = spectrogram(data[i, :], win_size * fs, overlap * fs, nfft)
+            Xi = 20 * np.log10(np.abs(Xi) + 1e-8)
+            X[i, :, :] = Xi[:, 1:129]
+            X_time[i] = interpolate_time_windows(
+                data[i, :],
+                window=win_size * fs,
+                step=(win_size - overlap) * fs,
+                target_len=128,
+                num_windows=29
+            )
+
+        tf_records.append((record_id, X))
+        time_records.append((record_id, X_time))
+
+    return tf_records, time_records
+
+
+def save_record_arrays(record_arrays, channel, save_dir, prefix):
+    """Save normalized per-record features using the same record IDs as labels."""
+    record_dir = os.path.join(save_dir, 'records', prefix, channel)
+    os.makedirs(record_dir, exist_ok=True)
+
+    metadata = []
+    for record_id, data in record_arrays:
+        save_path = os.path.join(record_dir, f'{record_id}.npy')
+        np.save(save_path, data)
+        metadata.append((record_id, int(data.shape[0])))
+
+    print(f'[INFO] Saved {len(record_arrays)} per-record {prefix} arrays for {channel} to {record_dir}')
+    return metadata
+
+
 def spectrogram(x, window, n_overlap, nfft):
     """
     Transform to time-frequency images.
@@ -167,6 +227,34 @@ def data_normalize(dataset, channel, save_dir, prefix='TF'):
     else:
         print(f'[ERROR] {channel} still contains inf or nan, not saved.')
 
+    return dataset
+
+
+def normalize_record_arrays(record_arrays, channel, save_dir, prefix='TF'):
+    """Normalize per-record arrays with a global channel mean/std and save old/new layouts."""
+    if not record_arrays:
+        raise ValueError(f'[ERROR] No {prefix} records found for channel={channel}')
+
+    dataset = np.concatenate([data for _, data in record_arrays], axis=0)
+    normalized = data_normalize(dataset=dataset, channel=channel, save_dir=save_dir, prefix=prefix)
+    if np.any(np.isinf(normalized)) or np.any(np.isnan(normalized)):
+        raise ValueError(f'[ERROR] Normalized {prefix} data for {channel} contains inf or nan')
+
+    offset = 0
+    normalized_records = []
+    for record_id, data in record_arrays:
+        next_offset = offset + data.shape[0]
+        normalized_records.append((record_id, normalized[offset:next_offset]))
+        offset = next_offset
+
+    if offset != normalized.shape[0]:
+        raise ValueError(
+            f'[ERROR] Per-record {prefix} normalization offset {offset} != global length {normalized.shape[0]}'
+        )
+
+    save_record_arrays(normalized_records, channel=channel, save_dir=save_dir, prefix=prefix)
+    return normalized_records
+
 
 def interpolate_time_windows(epoch, window=200, step=100, target_len=128, num_windows=29):
     """Slice one raw epoch with STFT-aligned windows and resample each window."""
@@ -207,30 +295,27 @@ if __name__ == '__main__':
     for channel in ['EEG_Fpz-Cz', 'EEG_Pz-Oz', 'EOG']:
         print('\n' + '-' * 15, f'Processing channel: {channel}', '-' * 15)
 
-        data_channel = data_array_concat(path_array=os.path.join(path.path_raw_data, channel))
-        X = np.zeros([data_channel.shape[0], 29, int(nfft / 2)], dtype=np.float32)
-        X_time = np.zeros([data_channel.shape[0], 29, 128], dtype=np.float32)
+        record_raw_arrays = load_record_raw_arrays(
+            path_array=os.path.join(path.path_raw_data, channel),
+            channel=channel
+        )
 
-        print('Transform to TF images:')
-        for i in tqdm(range(data_channel.shape[0])):
-            Xi = spectrogram(data_channel[i, :], win_size * fs, overlap * fs, nfft)
-            Xi = 20 * np.log10(np.abs(Xi) + 1e-8)
-            X[i, :, :] = Xi[:, 1:129]
+        print('Transform to TF images and time-domain interpolation windows:')
+        tf_records, time_records = transform_record_arrays(
+            record_raw_arrays,
+            fs=fs,
+            win_size=win_size,
+            overlap=overlap,
+            nfft=nfft
+        )
+
+        X = np.concatenate([data for _, data in tf_records], axis=0)
+        X_time = np.concatenate([data for _, data in time_records], axis=0)
 
         print(f'[INFO] TF image shape for {channel}: {X.shape}')
         print('Normalize TF:')
-        data_normalize(dataset=X, channel=channel, save_dir=path.path_TF, prefix='TF')
-
-        print('Transform to time-domain interpolation windows:')
-        for i in tqdm(range(data_channel.shape[0])):
-            X_time[i] = interpolate_time_windows(
-                data_channel[i, :],
-                window=win_size * fs,
-                step=(win_size - overlap) * fs,
-                target_len=128,
-                num_windows=29
-            )
+        normalize_record_arrays(record_arrays=tf_records, channel=channel, save_dir=path.path_TF, prefix='TF')
 
         print(f'[INFO] TIME image shape for {channel}: {X_time.shape}')
         print('Normalize TIME:')
-        data_normalize(dataset=X_time, channel=channel, save_dir=path.path_TF, prefix='TIME')
+        normalize_record_arrays(record_arrays=time_records, channel=channel, save_dir=path.path_TF, prefix='TIME')

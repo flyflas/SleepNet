@@ -11,17 +11,42 @@ from sklearn.metrics import (
     balanced_accuracy_score,
 )
 
-from sklearn.model_selection import StratifiedKFold
-
 import torch
-from torch.utils.data import TensorDataset, DataLoader
+from torch.utils.data import DataLoader
 
 from model_transformer_cross_c import Transformer
-from data_loader import data_generator
+from data_loader import (
+    build_context_dataset,
+    build_record_folds,
+    load_record_sequences,
+    log_record_split_summary,
+)
 from args import Config, Path
 
 
 CLASS_NAMES = ['Wake', 'N1', 'N2', 'N3', 'REM']
+
+
+class CheckpointIncompatibleError(RuntimeError):
+    pass
+
+
+class FoldSkippedError(RuntimeError):
+    pass
+
+
+def _safe_path_component(value):
+    value = str(value)
+    return ''.join(ch if ch.isalnum() or ch in ('-', '_', '.') else '_' for ch in value)
+
+
+def build_context_output_root(config, base_root='./Kfold_models'):
+    suffix = (
+        f'{config.model_name}_ctxL{config.context_length}_'
+        f'L{config.context_left}_R{config.context_right}_'
+        f'{config.split_group_policy}'
+    )
+    return f'{base_root}_{_safe_path_component(suffix)}'
 
 
 def specificity(y_true, y_pred, n=5):
@@ -131,15 +156,27 @@ def test(model, test_loader, config):
     )
 
 
-def evaluate_single_fold(config, dataset, labels, fold, test_idx):
-    path_model = f'./Kfold_models/fold{fold}/model.pkl'
+def _load_context_checkpoint(model, path_model, config):
+    try:
+        state_dict = torch.load(path_model, map_location=config.device)
+        model.load_state_dict(state_dict, strict=True)
+    except RuntimeError as exc:
+        raise CheckpointIncompatibleError(
+            f'[SKIP] checkpoint is incompatible with context model architecture: {path_model}. '
+            f'Detail: {exc}'
+        )
+
+
+def evaluate_single_fold(config, test_records, fold, output_root):
+    path_model = os.path.join(output_root, f'fold{fold}', 'model.pkl')
     if not os.path.exists(path_model):
-        raise FileNotFoundError(f'Model not found: {path_model}')
+        raise FileNotFoundError(f'[SKIP] fold {fold} context checkpoint not found: {path_model}')
 
-    X_test = dataset[test_idx]
-    y_test = labels[test_idx]
+    log_record_split_summary(f'test fold {fold}', test_records, config=config)
+    test_set = build_context_dataset(test_records, config=config)
+    if len(test_set) == 0:
+        raise FoldSkippedError(f'[SKIP] fold {fold} has no valid center epochs after context boundary dropping')
 
-    test_set = TensorDataset(X_test, y_test)
     test_loader = DataLoader(
         dataset=test_set,
         batch_size=config.batch_size,
@@ -148,22 +185,7 @@ def evaluate_single_fold(config, dataset, labels, fold, test_idx):
     )
 
     model = Transformer(config).to(config.device)
-    load_result = model.load_state_dict(torch.load(path_model, map_location=config.device), strict=False)
-    allowed_missing = {'modality_fuse.weight', 'modality_fuse.bias'}
-    unexpected = set(load_result.unexpected_keys)
-    missing = set(load_result.missing_keys)
-    if unexpected or (missing - allowed_missing):
-        raise RuntimeError(
-            f'[ERROR] Checkpoint mismatch. missing={load_result.missing_keys}, '
-            f'unexpected={load_result.unexpected_keys}'
-        )
-    if missing and dataset.dim() == 5:
-        raise RuntimeError(
-            '[ERROR] This checkpoint is frequency-only but the loaded dataset includes TIME data. '
-            'Call data_generator(..., use_time=False) or remove TIME files for frequency-only evaluation.'
-        )
-    if missing:
-        print(f'[INFO] Loaded frequency-only checkpoint without new modality fusion weights: {sorted(missing)}')
+    _load_context_checkpoint(model, path_model, config)
 
     result = test(model, test_loader, config)
 
@@ -174,13 +196,15 @@ def evaluate_single_fold(config, dataset, labels, fold, test_idx):
 
 
 def evaluate(config, path):
-    dataset, labels, _ = data_generator(
+    records = load_record_sequences(
         path_labels=path.path_labels,
         path_dataset=path.path_TF,
-        use_time=config.use_time
+        use_time=config.use_time,
+        config=config
     )
-
-    kf = StratifiedKFold(n_splits=config.num_fold, shuffle=True, random_state=0)
+    folds = build_record_folds(records, config=config, random_state=0)
+    output_root = build_context_output_root(config)
+    print(f'[INFO] context output root = {output_root}')
 
     ACC = 0.0
     Kappa = 0.0
@@ -192,26 +216,27 @@ def evaluate(config, path):
     Confusion_mat = np.zeros([5, 5], dtype=np.float64)
 
     valid_folds = []
+    skipped_folds = []
 
-    for fold, (_, test_idx) in enumerate(kf.split(dataset, labels)):
-        path_model = f'./Kfold_models/fold{fold}/model.pkl'
-        if not os.path.exists(path_model):
-            print(f'[SKIP] fold {fold} model not found')
-            continue
-
+    for fold, (_, test_records) in enumerate(folds):
         print('\n' + '-' * 15, '>', f'Fold {fold}', '<', '-' * 15)
 
-        (
-            accuracy,
-            cohens_kappa,
-            macro_f1,
-            weighted_f1,
-            average_sensitivity,
-            average_specificity,
-            balanced_acc,
-            con_mat,
-            _
-        ) = evaluate_single_fold(config, dataset, labels, fold, test_idx)
+        try:
+            (
+                accuracy,
+                cohens_kappa,
+                macro_f1,
+                weighted_f1,
+                average_sensitivity,
+                average_specificity,
+                balanced_acc,
+                con_mat,
+                _
+            ) = evaluate_single_fold(config, test_records, fold, output_root)
+        except (FileNotFoundError, FoldSkippedError, CheckpointIncompatibleError) as exc:
+            print(exc)
+            skipped_folds.append((fold, str(exc)))
+            continue
 
         ACC += accuracy
         Kappa += cohens_kappa
@@ -225,7 +250,10 @@ def evaluate(config, path):
         valid_folds.append(fold)
 
     if len(valid_folds) == 0:
-        raise RuntimeError('[ERROR] No trained fold models found.')
+        raise RuntimeError(
+            '[ERROR] No valid context fold evaluations completed. '
+            f'skipped_folds={skipped_folds}'
+        )
 
     num_valid = len(valid_folds)
     ACC /= num_valid
@@ -238,18 +266,36 @@ def evaluate(config, path):
 
     class_wise_result = class_wise_evaluate(Confusion_mat)
 
-    return ACC, Kappa, MF1, WF1, Sens, Spec, Bal_ACC, Confusion_mat, class_wise_result, valid_folds
+    return ACC, Kappa, MF1, WF1, Sens, Spec, Bal_ACC, Confusion_mat, class_wise_result, valid_folds, skipped_folds
 
 
 if __name__ == '__main__':
     config = Config()
     path = Path()
     print(f'[INFO] use_time = {config.use_time}')
+    print(
+        f'[INFO] context_left={config.context_left}, context_right={config.context_right}, '
+        f'context_length={config.context_length}, center_index={config.context_center_index}, '
+        f'split_group_policy={config.split_group_policy}'
+    )
 
-    ACC, Kappa, MF1, WF1, Sens, Spec, Bal_ACC, Confusion_mat, class_wise_result, valid_folds = evaluate(config, path)
+    (
+        ACC,
+        Kappa,
+        MF1,
+        WF1,
+        Sens,
+        Spec,
+        Bal_ACC,
+        Confusion_mat,
+        class_wise_result,
+        valid_folds,
+        skipped_folds,
+    ) = evaluate(config, path)
 
     print('\n===== FINAL RESULT =====')
     print('valid_folds: ', valid_folds)
+    print('skipped_folds: ', skipped_folds)
     print('ACC: ', ACC)
     print("Cohen's Kappa: ", Kappa)
     print('Macro-F1: ', MF1)

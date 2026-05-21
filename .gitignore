@@ -19,6 +19,7 @@ data/
 dataset/
 
 # --- IDE / Editor ---
+.codex
 .vscode/
 .idea/
 *.swp

@@ -8,14 +8,17 @@ from tqdm import tqdm
 import torch
 from torch import nn
 from torch import optim
-from torch.utils.data import TensorDataset, DataLoader
+from torch.utils.data import DataLoader
 
-from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import accuracy_score
 
 from model_transformer_cross_c import Transformer
 from early_stop_tool import EarlyStopping
-from data_loader import data_generator
+from data_loader import (
+    build_context_datasets_for_fold,
+    build_record_folds,
+    load_record_sequences,
+)
 from args import Config, Path
 from mlflow_logger import MlflowTrainingLogger, load_mlflow_env
 
@@ -69,6 +72,9 @@ def print_label_distribution(labels, split_name='dataset'):
 
 
 def build_dataloader(dataset, batch_size, shuffle, num_workers=8):
+    if len(dataset) == 0:
+        raise ValueError('[ERROR] Cannot build DataLoader for an empty context dataset')
+
     return DataLoader(
         dataset=dataset,
         batch_size=batch_size,
@@ -78,6 +84,46 @@ def build_dataloader(dataset, batch_size, shuffle, num_workers=8):
         persistent_workers=(num_workers > 0),
         prefetch_factor=2 if num_workers > 0 else None
     )
+
+
+def _safe_path_component(value):
+    value = str(value)
+    return ''.join(ch if ch.isalnum() or ch in ('-', '_', '.') else '_' for ch in value)
+
+
+def build_context_output_root(config, base_root='./Kfold_models'):
+    suffix = (
+        f'{config.model_name}_ctxL{config.context_length}_'
+        f'L{config.context_left}_R{config.context_right}_'
+        f'{config.split_group_policy}'
+    )
+    return f'{base_root}_{_safe_path_component(suffix)}'
+
+
+def _dataset_group_count(dataset):
+    return len(set(record.subject_id if dataset.config.split_group_policy == 'subject' else record.record_id
+                   for record in dataset.records))
+
+
+def log_context_dataset_summary(split_name, dataset):
+    record_count = len(set(record.record_id for record in dataset.records))
+    group_count = _dataset_group_count(dataset)
+    epoch_count = sum(record.epoch_count for record in dataset.records)
+    sample_count = len(dataset)
+    print(
+        f'[INFO][context {split_name}] input_shape={_context_input_shape(dataset)}, '
+        f'groups={group_count}, records={record_count}, epochs={epoch_count}, '
+        f'samples={sample_count}, dropped_boundary_epochs={dataset.dropped_boundary_epochs}'
+    )
+
+
+def _context_input_shape(dataset):
+    if len(dataset) > 0:
+        x, _ = dataset[0]
+        return tuple(x.shape)
+    if dataset.records:
+        return (dataset.context_length,) + tuple(dataset.records[0].features.shape[1:])
+    return (dataset.context_length,)
 
 
 def evaluate(model, loader, criterion, config, split_name='eval', print_distribution=False):
@@ -104,6 +150,9 @@ def evaluate(model, loader, criterion, config, split_name='eval', print_distribu
 
             all_preds.extend(pred.cpu().numpy())
             all_labels.extend(target.cpu().numpy())
+
+    if total_samples == 0:
+        raise ValueError(f'[ERROR] Cannot evaluate empty {split_name} context loader')
 
     avg_loss = total_loss / total_samples
     accuracy = accuracy_score(all_labels, all_preds)
@@ -154,7 +203,7 @@ def find_first_unfinished_fold(num_fold: int, root='./Kfold_models') -> int:
 
 def build_mlflow_params(config, fold, save_all_checkpoint):
     return {
-        'model_name': 'Transformer',
+        'model_name': config.model_name,
         'dataset_name': 'sleepEDF-78',
         'fold': fold,
         'num_fold': config.num_fold,
@@ -175,6 +224,18 @@ def build_mlflow_params(config, fold, save_all_checkpoint):
         'num_head': config.num_head,
         'num_encoder': config.num_encoder,
         'num_encoder_multi': config.num_encoder_multi,
+        'context_num_head': config.context_num_head,
+        'context_num_encoder': config.context_num_encoder,
+        'context_forward_hidden': config.context_forward_hidden,
+        'context_dropout': config.context_dropout,
+        'context_use_local_center_concat': config.context_use_local_center_concat,
+        'context_left': config.context_left,
+        'context_right': config.context_right,
+        'context_length': config.context_length,
+        'context_center_index': config.context_center_index,
+        'split_group_policy': config.split_group_policy,
+        'subject_id_length': config.subject_id_length,
+        'validation_group_fraction': config.validation_group_fraction,
         'use_positional_encoding': config.use_positional_encoding,
         'weight_decay': config.weight_decay,
         'early_stop_patience': config.early_stop_patience,
@@ -186,6 +247,7 @@ def build_mlflow_tags(fold):
     return {
         'entrypoint': 'Kfold_trainer.py',
         'fold': fold,
+        'training_mode': 'epoch_context',
     }
 
 
@@ -199,25 +261,29 @@ def train(save_all_checkpoint=False, start_fold=None):
     print(f'[INFO] learning_rate = {config.learning_rate}')
     print(f'[INFO] num_epochs = {config.num_epochs}')
     print(f'[INFO] use_time = {config.use_time}')
+    print(
+        f'[INFO] context_left={config.context_left}, context_right={config.context_right}, '
+        f'context_length={config.context_length}, center_index={config.context_center_index}'
+    )
+    print(
+        f'[INFO] split_group_policy={config.split_group_policy}, '
+        f'validation_group_fraction={config.validation_group_fraction}'
+    )
 
-    dataset, labels, val_loader = data_generator(
+    records = load_record_sequences(
         path_labels=path.path_labels,
         path_dataset=path.path_TF,
-        use_time=config.use_time
+        use_time=config.use_time,
+        config=config
     )
-
-    print(f'[INFO] dataset shape: {dataset.shape}')
-    print(f'[INFO] labels shape: {labels.shape}')
-    print_label_distribution(labels, split_name='full dataset')
-
-    kf = StratifiedKFold(
-        n_splits=config.num_fold,
-        shuffle=True,
-        random_state=0
-    )
+    labels = torch.cat([record.labels for record in records], dim=0)
+    print_label_distribution(labels, split_name='full record dataset')
+    folds = build_record_folds(records, config=config, random_state=0)
+    output_root = build_context_output_root(config)
+    print(f'[INFO] context output root = {output_root}')
 
     # 自动找未完成 fold
-    auto_start_fold = find_first_unfinished_fold(config.num_fold, root='./Kfold_models')
+    auto_start_fold = find_first_unfinished_fold(config.num_fold, root=output_root)
 
     if start_fold is None:
         start_fold = auto_start_fold
@@ -229,8 +295,8 @@ def train(save_all_checkpoint=False, start_fold=None):
         send_all_tasks_finished_notification()
         return
 
-    for fold, (train_idx, test_idx) in enumerate(kf.split(dataset, labels)):
-        fold_dir = f'./Kfold_models/fold{fold}'
+    for fold, (train_records, test_records) in enumerate(folds):
+        fold_dir = os.path.join(output_root, f'fold{fold}')
         os.makedirs(fold_dir, exist_ok=True)
 
         # 1) 小于 start_fold 的一律跳过
@@ -258,29 +324,33 @@ def train(save_all_checkpoint=False, start_fold=None):
 
         model = None
         try:
-            X_train, X_test = dataset[train_idx], dataset[test_idx]
-            y_train, y_test = labels[train_idx], labels[test_idx]
-
-            print(f'[INFO][fold {fold}] X_train shape = {X_train.shape}, y_train shape = {y_train.shape}')
-            print(f'[INFO][fold {fold}] X_test  shape = {X_test.shape}, y_test  shape = {y_test.shape}')
-
-            print_label_distribution(y_train, split_name=f'fold {fold} train')
-            print_label_distribution(y_test, split_name=f'fold {fold} test')
-
-            train_set = TensorDataset(X_train, y_train)
-            test_set = TensorDataset(X_test, y_test)
+            train_set, val_set, test_set = build_context_datasets_for_fold(
+                train_records=train_records,
+                test_records=test_records,
+                config=config,
+                fold=fold
+            )
+            log_context_dataset_summary('train', train_set)
+            log_context_dataset_summary('val', val_set)
+            log_context_dataset_summary('test', test_set)
 
             train_loader = build_dataloader(
                 dataset=train_set,
                 batch_size=config.batch_size,
                 shuffle=True,
-                num_workers=8
+                num_workers=config.num_workers
+            )
+            val_loader = build_dataloader(
+                dataset=val_set,
+                batch_size=config.batch_size,
+                shuffle=False,
+                num_workers=config.num_workers
             )
             test_loader = build_dataloader(
                 dataset=test_set,
                 batch_size=config.batch_size,
                 shuffle=False,
-                num_workers=8
+                num_workers=config.num_workers
             )
 
             model = Transformer(config).to(config.device)
