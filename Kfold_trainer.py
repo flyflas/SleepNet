@@ -1,4 +1,7 @@
+import json
 import os
+import urllib.request
+
 import numpy as np
 from tqdm import tqdm
 
@@ -15,6 +18,32 @@ from early_stop_tool import EarlyStopping
 from data_loader import data_generator
 from args import Config, Path
 from mlflow_logger import MlflowTrainingLogger, load_mlflow_env
+
+
+NOTIFICATION_URL = 'http://8.209.229.122:8181/send'
+NOTIFICATION_HEADERS = {
+    'Authentication': 'Bearer 927efb8b-2fbf-4903-9c07-8b1798d57d98',
+    'Content-Type': 'application/json',
+}
+NOTIFICATION_PAYLOAD = {
+    'subject': 'sleep 训练任务已全部完成',
+    'body': 'Kfold_trainer.py 的所有 fold 训练任务已全部完成。',
+}
+
+
+def send_all_tasks_finished_notification():
+    try:
+        data = json.dumps(NOTIFICATION_PAYLOAD, ensure_ascii=False).encode('utf-8')
+        request = urllib.request.Request(
+            NOTIFICATION_URL,
+            data=data,
+            headers=NOTIFICATION_HEADERS,
+            method='POST'
+        )
+        with urllib.request.urlopen(request, timeout=10) as response:
+            response.read()
+    except Exception as exc:
+        print(f'[WARNING] Failed to send all-tasks-finished notification: {exc}')
 
 
 def set_random_seed(seed=0):
@@ -197,6 +226,7 @@ def train(save_all_checkpoint=False, start_fold=None):
 
     if start_fold >= config.num_fold:
         print('[INFO] All folds are already finished. Nothing to do.')
+        send_all_tasks_finished_notification()
         return
 
     for fold, (train_idx, test_idx) in enumerate(kf.split(dataset, labels)):
@@ -398,6 +428,8 @@ def train(save_all_checkpoint=False, start_fold=None):
             if model is not None:
                 del model
             torch.cuda.empty_cache()
+
+    send_all_tasks_finished_notification()
 
 
 if __name__ == '__main__':
