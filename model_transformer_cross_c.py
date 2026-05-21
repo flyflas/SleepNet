@@ -85,15 +85,9 @@ class Transformer(nn.Module):
         self.transformer_encoder_2 = nn.TransformerEncoder(encoder_layer_2, num_layers=config.num_encoder)
         self.transformer_encoder_3 = nn.TransformerEncoder(encoder_layer_3, num_layers=config.num_encoder)
 
-        self.cross_eeg12 = CrossAttentionBlock(config.dim_model, config.num_head, config.dropout)
-        self.cross_eeg21 = CrossAttentionBlock(config.dim_model, config.num_head, config.dropout)
-        self.cross_eeg_eog = CrossAttentionBlock(config.dim_model, config.num_head, config.dropout)
-
-        self.eeg_fuse = nn.Sequential(
-            nn.Linear(config.dim_model * 2, config.dim_model),
-            nn.GELU(),
-            nn.Dropout(config.dropout)
-        )
+        self.cross_eeg1_eog = CrossAttentionBlock(config.dim_model, config.num_head, config.dropout)
+        self.cross_eeg2_eog = CrossAttentionBlock(config.dim_model, config.num_head, config.dropout)
+        self.cross_eog_eeg = CrossAttentionBlock(config.dim_model, config.num_head, config.dropout)
 
         self.drop = nn.Dropout(0.5)
         self.layer_norm = nn.LayerNorm(config.dim_model * 3)
@@ -130,14 +124,13 @@ class Transformer(nn.Module):
         x2 = self.transformer_encoder_2(x2)
         x3 = self.transformer_encoder_3(x3)
 
-        x12_from_1 = self.cross_eeg12(x1, x2, x2)
-        x12_from_2 = self.cross_eeg21(x2, x1, x1)
-        x12 = self.eeg_fuse(torch.cat([x12_from_1, x12_from_2], dim=2))
+        x1_eog = self.cross_eeg1_eog(x1, x3, x3)
+        x2_eog = self.cross_eeg2_eog(x2, x3, x3)
 
-        x1e = self.cross_eeg_eog(x1, x3, x3)
-        x2e = self.cross_eeg_eog(x2, x3, x3)
+        eeg_fusion = 0.5 * (x1 + x2)
+        x3_eeg = self.cross_eog_eeg(x3, eeg_fusion, eeg_fusion)
 
-        x = torch.cat([x12, x1e, x2e], dim=2)
+        x = torch.cat([x1_eog, x2_eog, x3_eeg], dim=2)
 
         x = self.drop(x)
         x = self.layer_norm(x)
