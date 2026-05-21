@@ -14,6 +14,7 @@ from model_transformer_cross_c import Transformer
 from early_stop_tool import EarlyStopping
 from data_loader import data_generator
 from args import Config, Path
+from mlflow_logger import MlflowTrainingLogger, load_mlflow_env
 
 
 def set_random_seed(seed=0):
@@ -122,7 +123,45 @@ def find_first_unfinished_fold(num_fold: int, root='./Kfold_models') -> int:
     return num_fold
 
 
+def build_mlflow_params(config, fold, save_all_checkpoint):
+    return {
+        'model_name': 'Transformer',
+        'dataset_name': 'sleepEDF-78',
+        'fold': fold,
+        'num_fold': config.num_fold,
+        'epochs': config.num_epochs,
+        'batch_size': config.batch_size,
+        'learning_rate': config.learning_rate,
+        'optimizer_name': 'AdamW',
+        'scheduler_name': None,
+        'seed': 0,
+        'device': str(config.device),
+        'cuda_available': torch.cuda.is_available(),
+        'num_classes': config.num_classes,
+        'pad_size': config.pad_size,
+        'dropout': config.dropout,
+        'dim_model': config.dim_model,
+        'forward_hidden': config.forward_hidden,
+        'fc_hidden': config.fc_hidden,
+        'num_head': config.num_head,
+        'num_encoder': config.num_encoder,
+        'num_encoder_multi': config.num_encoder_multi,
+        'use_positional_encoding': config.use_positional_encoding,
+        'weight_decay': config.weight_decay,
+        'early_stop_patience': config.early_stop_patience,
+        'save_all_checkpoint': save_all_checkpoint,
+    }
+
+
+def build_mlflow_tags(fold):
+    return {
+        'entrypoint': 'Kfold_trainer.py',
+        'fold': fold,
+    }
+
+
 def train(save_all_checkpoint=False, start_fold=None):
+    load_mlflow_env()
     config = Config()
     path = Path()
 
@@ -173,139 +212,190 @@ def train(save_all_checkpoint=False, start_fold=None):
             continue
 
         print('\n' + '-' * 15 + f' > Fold {fold} < ' + '-' * 15)
+        mlflow_run_name = os.getenv('MLFLOW_RUN_NAME')
+        if mlflow_run_name:
+            mlflow_run_name = f'{mlflow_run_name}-fold-{fold}'
+        else:
+            mlflow_run_name = f'fold-{fold}'
 
-        X_train, X_test = dataset[train_idx], dataset[test_idx]
-        y_train, y_test = labels[train_idx], labels[test_idx]
-
-        print(f'[INFO][fold {fold}] X_train shape = {X_train.shape}, y_train shape = {y_train.shape}')
-        print(f'[INFO][fold {fold}] X_test  shape = {X_test.shape}, y_test  shape = {y_test.shape}')
-
-        print_label_distribution(y_train, split_name=f'fold {fold} train')
-        print_label_distribution(y_test, split_name=f'fold {fold} test')
-
-        train_set = TensorDataset(X_train, y_train)
-        test_set = TensorDataset(X_test, y_test)
-
-        train_loader = build_dataloader(
-            dataset=train_set,
-            batch_size=config.batch_size,
-            shuffle=True,
-            num_workers=8
-        )
-        test_loader = build_dataloader(
-            dataset=test_set,
-            batch_size=config.batch_size,
-            shuffle=False,
-            num_workers=8
+        mlflow_logger = MlflowTrainingLogger(run_name=mlflow_run_name)
+        mlflow_logger.start(
+            params=build_mlflow_params(config, fold, save_all_checkpoint),
+            tags=build_mlflow_tags(fold)
         )
 
-        model = Transformer(config).to(config.device)
-        criterion = nn.CrossEntropyLoss()
+        model = None
+        try:
+            X_train, X_test = dataset[train_idx], dataset[test_idx]
+            y_train, y_test = labels[train_idx], labels[test_idx]
 
-        optimizer = optim.AdamW(
-            model.parameters(),
-            lr=config.learning_rate,
-            weight_decay=0.01
-        )
+            print(f'[INFO][fold {fold}] X_train shape = {X_train.shape}, y_train shape = {y_train.shape}')
+            print(f'[INFO][fold {fold}] X_test  shape = {X_test.shape}, y_test  shape = {y_test.shape}')
 
-        early_stopping = EarlyStopping(
-            patience=12,
-            verbose=True,
-            save_all_checkpoint=save_all_checkpoint
-        )
+            print_label_distribution(y_train, split_name=f'fold {fold} train')
+            print_label_distribution(y_test, split_name=f'fold {fold} test')
 
-        train_ACC = []
-        train_LOSS = []
-        test_ACC = []
-        test_LOSS = []
-        val_ACC = []
-        val_LOSS = []
+            train_set = TensorDataset(X_train, y_train)
+            test_set = TensorDataset(X_test, y_test)
 
-        for epoch in range(config.num_epochs):
-            model.train()
+            train_loader = build_dataloader(
+                dataset=train_set,
+                batch_size=config.batch_size,
+                shuffle=True,
+                num_workers=8
+            )
+            test_loader = build_dataloader(
+                dataset=test_set,
+                batch_size=config.batch_size,
+                shuffle=False,
+                num_workers=8
+            )
 
-            total_train_loss = 0.0
-            total_train_correct = 0
-            total_train_samples = 0
+            model = Transformer(config).to(config.device)
+            criterion = nn.CrossEntropyLoss()
 
-            loop = tqdm(train_loader, total=len(train_loader), desc=f'Fold {fold} Epoch {epoch}')
+            optimizer = optim.AdamW(
+                model.parameters(),
+                lr=config.learning_rate,
+                weight_decay=0.01
+            )
 
-            for data, target in loop:
-                data = data.to(config.device, non_blocking=True)
-                target = target.to(config.device, non_blocking=True).long()
+            early_stopping = EarlyStopping(
+                patience=config.early_stop_patience,
+                verbose=True,
+                save_all_checkpoint=save_all_checkpoint
+            )
 
-                optimizer.zero_grad()
-                output = model(data)
-                loss = criterion(output, target)
-                loss.backward()
-                optimizer.step()
+            train_ACC = []
+            train_LOSS = []
+            test_ACC = []
+            test_LOSS = []
+            val_ACC = []
+            val_LOSS = []
+            global_step = 0
+            global_samples_seen = 0
 
-                pred = torch.argmax(output, dim=1)
+            for epoch in range(config.num_epochs):
+                model.train()
 
-                batch_size = target.size(0)
-                total_train_loss += loss.item() * batch_size
-                total_train_correct += (pred == target).sum().item()
-                total_train_samples += batch_size
+                total_train_loss = 0.0
+                total_train_correct = 0
+                total_train_samples = 0
 
-                train_acc_batch = (pred == target).float().mean().item()
+                loop = tqdm(train_loader, total=len(train_loader), desc=f'Fold {fold} Epoch {epoch}')
 
-                loop.set_postfix(
-                    loss=f'{loss.item():.4f}',
-                    train_acc=f'{train_acc_batch:.4f}'
+                for data, target in loop:
+                    data = data.to(config.device, non_blocking=True)
+                    target = target.to(config.device, non_blocking=True).long()
+
+                    optimizer.zero_grad()
+                    output = model(data)
+                    loss = criterion(output, target)
+                    loss.backward()
+                    optimizer.step()
+
+                    pred = torch.argmax(output, dim=1)
+
+                    batch_size = target.size(0)
+                    total_train_loss += loss.item() * batch_size
+                    total_train_correct += (pred == target).sum().item()
+                    total_train_samples += batch_size
+                    global_step += 1
+                    global_samples_seen += batch_size
+
+                    train_acc_batch = (pred == target).float().mean().item()
+                    current_lr = optimizer.param_groups[0]['lr']
+                    mlflow_logger.log_train_step(
+                        step=global_step,
+                        epoch=epoch,
+                        loss=loss.item(),
+                        acc=train_acc_batch,
+                        lr=current_lr,
+                        samples_seen=global_samples_seen,
+                        extra_metrics={'fold': fold}
+                    )
+
+                    loop.set_postfix(
+                        loss=f'{loss.item():.4f}',
+                        train_acc=f'{train_acc_batch:.4f}'
+                    )
+
+                train_loss = total_train_loss / total_train_samples
+                train_acc = total_train_correct / total_train_samples
+
+                need_print_dist = (epoch < 3) or (epoch % 10 == 0)
+
+                test_acc, test_loss = evaluate(
+                    model=model,
+                    loader=test_loader,
+                    criterion=criterion,
+                    config=config,
+                    split_name='test',
+                    print_distribution=need_print_dist
+                )
+                val_acc, val_loss = evaluate(
+                    model=model,
+                    loader=val_loader,
+                    criterion=criterion,
+                    config=config,
+                    split_name='val',
+                    print_distribution=need_print_dist
+                )
+                mlflow_logger.log_validation(
+                    step=global_step,
+                    epoch=epoch,
+                    val_loss=val_loss,
+                    val_acc=val_acc,
+                    extra_metrics={
+                        'fold': fold,
+                        'test/loss': test_loss,
+                        'test/acc': test_acc,
+                        'train/loss_epoch': train_loss,
+                        'train/acc_epoch': train_acc,
+                    }
                 )
 
-            train_loss = total_train_loss / total_train_samples
-            train_acc = total_train_correct / total_train_samples
+                print(
+                    f'Epoch: {epoch:3d} | '
+                    f'train loss: {train_loss:.4f} | train acc: {train_acc:.4f} | '
+                    f'val acc: {val_acc:.4f} | val loss: {val_loss:.4f} | '
+                    f'test acc: {test_acc:.4f} | test loss: {test_loss:.4f}'
+                )
 
-            need_print_dist = (epoch < 3) or (epoch % 10 == 0)
+                train_ACC.append(train_acc)
+                train_LOSS.append(train_loss)
+                test_ACC.append(test_acc)
+                test_LOSS.append(test_loss)
+                val_ACC.append(val_acc)
+                val_LOSS.append(val_loss)
 
-            test_acc, test_loss = evaluate(
-                model=model,
-                loader=test_loader,
-                criterion=criterion,
-                config=config,
-                split_name='test',
-                print_distribution=need_print_dist
-            )
-            val_acc, val_loss = evaluate(
-                model=model,
-                loader=val_loader,
-                criterion=criterion,
-                config=config,
-                split_name='val',
-                print_distribution=need_print_dist
-            )
+                model_path = os.path.join(fold_dir, f'model_{fold}_epoch{epoch}.pkl')
+                checkpoint_path = early_stopping(val_acc, model, path=model_path)
+                if checkpoint_path:
+                    mlflow_logger.log_artifact(checkpoint_path, artifact_path='checkpoints')
 
-            print(
-                f'Epoch: {epoch:3d} | '
-                f'train loss: {train_loss:.4f} | train acc: {train_acc:.4f} | '
-                f'val acc: {val_acc:.4f} | val loss: {val_loss:.4f} | '
-                f'test acc: {test_acc:.4f} | test loss: {test_loss:.4f}'
-            )
+                if early_stopping.early_stop:
+                    print(f'[INFO] Early stopping at epoch {epoch}')
+                    break
 
-            train_ACC.append(train_acc)
-            train_LOSS.append(train_loss)
-            test_ACC.append(test_acc)
-            test_LOSS.append(test_loss)
-            val_ACC.append(val_acc)
-            val_LOSS.append(val_loss)
+            np.save(os.path.join(fold_dir, 'train_LOSS.npy'), np.array(train_LOSS))
+            np.save(os.path.join(fold_dir, 'train_ACC.npy'), np.array(train_ACC))
+            np.save(os.path.join(fold_dir, 'test_LOSS.npy'), np.array(test_LOSS))
+            np.save(os.path.join(fold_dir, 'test_ACC.npy'), np.array(test_ACC))
+            np.save(os.path.join(fold_dir, 'val_LOSS.npy'), np.array(val_LOSS))
+            np.save(os.path.join(fold_dir, 'val_ACC.npy'), np.array(val_ACC))
 
-            model_path = os.path.join(fold_dir, f'model_{fold}_epoch{epoch}.pkl')
-            early_stopping(val_acc, model, path=model_path)
-
-            if early_stopping.early_stop:
-                print(f'[INFO] Early stopping at epoch {epoch}')
-                break
-
-        np.save(os.path.join(fold_dir, 'train_LOSS.npy'), np.array(train_LOSS))
-        np.save(os.path.join(fold_dir, 'train_ACC.npy'), np.array(train_ACC))
-        np.save(os.path.join(fold_dir, 'test_LOSS.npy'), np.array(test_LOSS))
-        np.save(os.path.join(fold_dir, 'test_ACC.npy'), np.array(test_ACC))
-        np.save(os.path.join(fold_dir, 'val_LOSS.npy'), np.array(val_LOSS))
-        np.save(os.path.join(fold_dir, 'val_ACC.npy'), np.array(val_ACC))
-
-        del model
-        torch.cuda.empty_cache()
+            mlflow_logger.end('FINISHED')
+        except Exception:
+            try:
+                mlflow_logger.end('FAILED')
+            except Exception as exc:
+                print(f'[MLflow warning] end failed while handling training exception: {exc}')
+            raise
+        finally:
+            if model is not None:
+                del model
+            torch.cuda.empty_cache()
 
 
 if __name__ == '__main__':

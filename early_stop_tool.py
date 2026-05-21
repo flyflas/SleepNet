@@ -56,6 +56,7 @@ class EarlyStopping:
             val_acc if mode='max'
             val_loss if mode='min'
         """
+        checkpoint_path = None
         if self.mode == 'max':
             score = metric_value
             improved = score > self.best_score + self.delta if self.best_score is not None else True
@@ -65,11 +66,11 @@ class EarlyStopping:
 
         if self.best_score is None:
             self.best_score = score
-            self.save_checkpoint(metric_value, model, path)
+            checkpoint_path = self.save_checkpoint(metric_value, model, path)
 
         elif improved:
             self.best_score = score
-            self.save_checkpoint(metric_value, model, path)
+            checkpoint_path = self.save_checkpoint(metric_value, model, path)
             self.counter = 0
 
         else:
@@ -80,6 +81,7 @@ class EarlyStopping:
             )
             if self.counter >= self.patience:
                 self.early_stop = True
+        return checkpoint_path
 
     def save_checkpoint(self, metric_value, model, path):
         """Save model when monitored metric improves."""
@@ -98,3 +100,4 @@ class EarlyStopping:
 
         torch.save(model.state_dict(), path)
         self.best_metric = metric_value
+        return path
