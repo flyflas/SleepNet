@@ -49,20 +49,20 @@ class Config(object):
         self.learning_rate = 5e-5
 
         # model settings
-        self.dropout = 0.1
+        self.dropout = 0.2
         self.dim_model = 128
-        self.forward_hidden = 1024
-        self.fc_hidden = 1024
+        self.forward_hidden = 512
+        self.fc_hidden = 512
         self.num_head = 8
-        self.num_encoder = 16
-        self.num_encoder_multi = 4
+        self.num_encoder = 8
+        self.num_encoder_multi = 2
         self.model_name = 'transformer_epoch_context'
 
         # epoch-level context encoder settings
         self.context_num_head = 8
         self.context_num_encoder = 2
         self.context_forward_hidden = 1024
-        self.context_dropout = 0.1
+        self.context_dropout = 0.2
         self.context_use_local_center_concat = True
 
         # mamba settings

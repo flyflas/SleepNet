@@ -65,8 +65,8 @@ class Transformer(nn.Module):
         self.epoch_embedding_dim = config.fc_hidden
         self.use_local_center_concat = config.context_use_local_center_concat
 
-        self.position_single = PositionalEncoding(config.dim_model, 0.1, config.pad_size + 1)
-        self.position_multi = PositionalEncoding(config.dim_model * 3, 0.1, config.pad_size + 1)
+        self.position_single = PositionalEncoding(config.dim_model, config.dropout, config.pad_size + 1)
+        self.position_multi = PositionalEncoding(config.dim_model * 3, config.dropout, config.pad_size + 1)
         self.position_context = PositionalEncoding(
             config.fc_hidden,
             config.context_dropout,
@@ -104,7 +104,7 @@ class Transformer(nn.Module):
         self.cross_eeg2_eog = CrossAttentionBlock(config.dim_model, config.num_head, config.dropout)
         self.cross_eog_eeg = CrossAttentionBlock(config.dim_model, config.num_head, config.dropout)
 
-        self.drop = nn.Dropout(0.5)
+        self.drop = nn.Dropout(config.dropout)
         self.layer_norm = nn.LayerNorm(config.dim_model * 3)
 
         encoder_layer_multi = nn.TransformerEncoderLayer(
@@ -122,7 +122,7 @@ class Transformer(nn.Module):
         self.fc1 = nn.Sequential(
             nn.Linear(config.pad_size * config.dim_model * 3, config.fc_hidden),
             nn.ReLU(),
-            nn.Dropout(0.5)
+            nn.Dropout(config.dropout)
         )
         context_layer = nn.TransformerEncoderLayer(
             d_model=config.fc_hidden,

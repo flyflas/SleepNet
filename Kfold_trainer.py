@@ -254,7 +254,10 @@ def build_mlflow_params(config, fold, save_all_checkpoint):
         'batch_size': config.batch_size,
         'learning_rate': config.learning_rate,
         'optimizer_name': 'AdamW',
-        'scheduler_name': None,
+        'scheduler_name': 'ReduceLROnPlateau',
+        'scheduler_factor': config.scheduler_factor,
+        'scheduler_patience': config.scheduler_patience,
+        'scheduler_min_lr': config.scheduler_min_lr,
         'seed': 0,
         'device': str(config.device),
         'cuda_available': torch.cuda.is_available(),
@@ -280,7 +283,9 @@ def build_mlflow_params(config, fold, save_all_checkpoint):
         'subject_id_length': config.subject_id_length,
         'validation_group_fraction': config.validation_group_fraction,
         'use_positional_encoding': config.use_positional_encoding,
+        'label_smoothing': config.label_smoothing,
         'weight_decay': config.weight_decay,
+        'grad_clip': config.grad_clip,
         'use_amp': config.use_amp,
         'amp_dtype': config.amp_dtype,
         'allow_tf32': config.allow_tf32,
@@ -294,6 +299,8 @@ def build_mlflow_params(config, fold, save_all_checkpoint):
         'train_log_every_n_steps': config.train_log_every_n_steps,
         'progress_every_n_steps': config.progress_every_n_steps,
         'early_stop_patience': config.early_stop_patience,
+        'early_stop_delta': config.early_stop_delta,
+        'early_stop_monitor': 'val_loss',
         'save_all_checkpoint': save_all_checkpoint,
     }
 
@@ -429,19 +436,29 @@ def train(save_all_checkpoint=False, start_fold=None):
             model_for_checkpoint = model
             if config.compile_model:
                 model = torch.compile(model, mode=config.compile_mode)
-            criterion = nn.CrossEntropyLoss()
+            criterion = nn.CrossEntropyLoss(label_smoothing=config.label_smoothing)
             grad_scaler = build_grad_scaler(config)
 
             optimizer = optim.AdamW(
                 model.parameters(),
                 lr=config.learning_rate,
-                weight_decay=0.01
+                weight_decay=config.weight_decay
+            )
+            scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer,
+                mode='min',
+                factor=config.scheduler_factor,
+                patience=config.scheduler_patience,
+                min_lr=config.scheduler_min_lr
             )
 
             early_stopping = EarlyStopping(
                 patience=config.early_stop_patience,
                 verbose=True,
-                save_all_checkpoint=save_all_checkpoint
+                delta=config.early_stop_delta,
+                save_all_checkpoint=save_all_checkpoint,
+                mode='min',
+                monitor_name='val_loss'
             )
 
             train_ACC = []
@@ -476,6 +493,9 @@ def train(save_all_checkpoint=False, start_fold=None):
                         output = model(data)
                         loss = criterion(output, target)
                     grad_scaler.scale(loss).backward()
+                    if config.grad_clip is not None and config.grad_clip > 0:
+                        grad_scaler.unscale_(optimizer)
+                        nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
                     grad_scaler.step(optimizer)
                     grad_scaler.update()
 
@@ -532,6 +552,8 @@ def train(save_all_checkpoint=False, start_fold=None):
                     split_name='val',
                     print_distribution=need_print_dist
                 )
+                scheduler.step(val_loss)
+                current_lr = optimizer.param_groups[0]['lr']
                 mlflow_logger.log_validation(
                     step=global_step,
                     epoch=epoch,
@@ -543,6 +565,7 @@ def train(save_all_checkpoint=False, start_fold=None):
                         'test/acc': test_acc,
                         'train/loss_epoch': train_loss,
                         'train/acc_epoch': train_acc,
+                        'lr': current_lr,
                     }
                 )
 
@@ -561,7 +584,7 @@ def train(save_all_checkpoint=False, start_fold=None):
                 val_LOSS.append(val_loss)
 
                 model_path = os.path.join(fold_dir, f'model_{fold}_epoch{epoch}.pkl')
-                checkpoint_path = early_stopping(val_acc, model_for_checkpoint, path=model_path)
+                checkpoint_path = early_stopping(val_loss, model_for_checkpoint, path=model_path)
                 if checkpoint_path:
                     mlflow_logger.log_artifact(checkpoint_path, artifact_path='checkpoints')
 
