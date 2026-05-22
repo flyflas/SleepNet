@@ -1,6 +1,8 @@
 import torch
 import os
 
+from env_utils import load_env
+
 
 class Config(object):
     """args in model and trainer"""
@@ -92,10 +94,14 @@ class Config(object):
 class Path(object):
     """path of files in this project"""
     def __init__(self):
-        old_root = '/Users/xiaobai/Documents/model'
+        load_env()
+        data_root = os.getenv('DATA_ROOT')
+        if not data_root or not data_root.strip():
+            raise RuntimeError('[ERROR] DATA_ROOT must be set in .env or environment variables')
+        data_root = data_root.strip()
 
-        self.path_PSG = os.path.join(old_root, 'dataset/Sleep-EDF-78/sleep-edfx/sleep-cassette')
-        self.path_hypnogram = os.path.join(old_root, 'dataset/Sleep-EDF-78/sleep-edfx/Hypnogram')
-        self.path_raw_data = os.path.join(old_root, 'data/sleepEDF-78/data_array/raw_data')
-        self.path_labels = os.path.join(old_root, 'data/sleepEDF-78/data_array/raw_data/labels')
-        self.path_TF = os.path.join(old_root, 'data/sleepEDF-78/data_array/TF_data')
+        self.path_PSG = os.path.join(data_root, 'dataset/Sleep-EDF-78/sleep-edfx/sleep-cassette')
+        self.path_hypnogram = os.path.join(data_root, 'dataset/Sleep-EDF-78/sleep-edfx/Hypnogram')
+        self.path_raw_data = os.path.join(data_root, 'data/sleepEDF-78/data_array/raw_data')
+        self.path_labels = os.path.join(data_root, 'data/sleepEDF-78/data_array/raw_data/labels')
+        self.path_TF = os.path.join(data_root, 'data/sleepEDF-78/data_array/TF_data')

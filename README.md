@@ -32,7 +32,15 @@ python -m py_compile args.py data_loader.py model_transformer_cross_c.py Kfold_t
 python data_loader.py
 ```
 
-`python data_loader.py`, full training, and full evaluation require the external Sleep-EDF arrays configured under `/openbayes/input/input0`.
+`python data_loader.py`, full training, and full evaluation require the external Sleep-EDF arrays configured under `DATA_ROOT`.
+
+Configure the shared data root before running preprocessing, training, or evaluation:
+
+```bash
+export DATA_ROOT="/Users/xiaobai/Documents/model"
+```
+
+You can also place `DATA_ROOT` in a local `.env` file. `args.py` loads `.env` and environment variables; if `DATA_ROOT` is missing or empty, path initialization fails immediately.
 
 ## MLflow Monitoring
 
@@ -47,6 +55,7 @@ pip install mlflow python-dotenv
 Configure local environment variables:
 
 ```bash
+export DATA_ROOT="/Users/xiaobai/Documents/model"
 export MLFLOW_TRACKING_URI="http://YOUR_SERVER_IP:5000"
 export MLFLOW_TRACKING_USERNAME="admin"
 export MLFLOW_TRACKING_PASSWORD="YOUR_PASSWORD"

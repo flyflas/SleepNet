@@ -2,35 +2,13 @@ from __future__ import annotations
 
 import math
 import os
-from pathlib import Path
 from typing import Any, Callable
+
+from env_utils import load_env
 
 
 def load_mlflow_env() -> None:
-    try:
-        from dotenv import load_dotenv
-    except Exception:
-        _load_dotenv_fallback()
-        return
-
-    load_dotenv()
-
-
-def _load_dotenv_fallback(env_path: str = ".env") -> None:
-    path = Path(env_path)
-    if not path.exists():
-        return
-
-    for line in path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-
-        key, value = line.split("=", 1)
-        key = key.strip()
-        value = value.strip().strip('"').strip("'")
-        if key:
-            os.environ.setdefault(key, value)
+    load_env()
 
 
 def _parse_bool(value: str | None, default: bool) -> bool:
