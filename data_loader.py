@@ -390,6 +390,25 @@ def _subject_id_from_record_id(record_id, config):
     return record_id[:config.subject_id_length]
 
 
+def _load_label_array(file_path):
+    """Load label arrays while preserving safety for normal numeric npy files."""
+    try:
+        labels = np.load(file_path)
+    except ValueError as exc:
+        if 'allow_pickle' not in str(exc):
+            raise
+        labels = np.load(file_path, allow_pickle=True)
+
+    labels = np.asarray(labels)
+    if labels.dtype == object:
+        try:
+            labels = np.asarray(labels.tolist())
+        except Exception as exc:
+            raise ValueError(f'[ERROR] Failed to normalize object labels from {file_path}') from exc
+
+    return labels.astype(np.int64)
+
+
 def enumerate_label_records(path_labels, config=None):
     """Enumerate records from sorted label files before feature concat/windowing."""
     config = config if config is not None else Config()
@@ -400,7 +419,7 @@ def enumerate_label_records(path_labels, config=None):
     records = []
     for f in label_files:
         record_id = _record_id_from_label_file(f)
-        labels = np.load(os.path.join(path_labels, f)).astype(np.int64)
+        labels = _load_label_array(os.path.join(path_labels, f))
         if labels.ndim != 1:
             raise ValueError(f'[ERROR] Labels for {record_id} must be rank 1, got {labels.shape}')
         records.append({
@@ -647,7 +666,7 @@ def data_generator(path_labels, path_dataset, use_time=_DEFAULT_USE_TIME):
     # 2. 按排序后的文件顺序拼接 labels
     label_list = []
     for f in label_files:
-        y = np.load(os.path.join(path_labels, f))
+        y = _load_label_array(os.path.join(path_labels, f))
         label_list.append(y)
 
     labels = np.concatenate(label_list, axis=0).astype(np.int64)
