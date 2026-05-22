@@ -34,6 +34,26 @@ python data_loader.py
 
 `python data_loader.py`, full training, and full evaluation require the external Sleep-EDF arrays configured under `DATA_ROOT`.
 
+## Throughput Tuning
+
+The trainer exposes runtime knobs through `.env` or exported environment variables. On RTX 5090-class GPUs, start by increasing batch size until memory is near full, keep AMP on with bf16, and reduce per-step logging.
+
+```bash
+export SLEEP_BATCH_SIZE=192
+export SLEEP_NUM_WORKERS=16
+export SLEEP_PREFETCH_FACTOR=4
+export SLEEP_USE_AMP=true
+export SLEEP_AMP_DTYPE=bf16
+export SLEEP_ALLOW_TF32=true
+export SLEEP_DETERMINISTIC=false
+export SLEEP_TRAIN_LOG_EVERY_N_STEPS=100
+export SLEEP_PROGRESS_EVERY_N_STEPS=25
+
+python Kfold_trainer.py
+```
+
+If GPU memory is still underused, try `SLEEP_BATCH_SIZE=256`, then `384`. If the run is stable and long enough to amortize compile time, try `SLEEP_COMPILE_MODEL=true`; the first epoch may be slower while PyTorch compiles graphs.
+
 Configure the shared data root before running preprocessing, training, or evaluation:
 
 ```bash

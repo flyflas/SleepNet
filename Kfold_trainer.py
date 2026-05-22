@@ -1,6 +1,7 @@
 import json
 import os
 import urllib.request
+from contextlib import nullcontext
 
 import numpy as np
 from tqdm import tqdm
@@ -9,8 +10,6 @@ import torch
 from torch import nn
 from torch import optim
 from torch.utils.data import DataLoader
-
-from sklearn.metrics import accuracy_score
 
 from model_transformer_cross_c import Transformer
 from early_stop_tool import EarlyStopping
@@ -49,14 +48,47 @@ def send_all_tasks_finished_notification():
         print(f'[WARNING] Failed to send all-tasks-finished notification: {exc}')
 
 
-def set_random_seed(seed=0):
+def configure_torch_runtime(config):
+    if torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = config.allow_tf32
+        torch.backends.cudnn.allow_tf32 = config.allow_tf32
+        try:
+            torch.set_float32_matmul_precision('high' if config.allow_tf32 else 'highest')
+        except Exception:
+            pass
+
+    torch.backends.cudnn.deterministic = config.deterministic
+    torch.backends.cudnn.benchmark = not config.deterministic
+
+
+def amp_dtype_from_config(config):
+    dtype = str(config.amp_dtype).lower()
+    if dtype in ('bf16', 'bfloat16'):
+        return torch.bfloat16
+    if dtype in ('fp16', 'float16', 'half'):
+        return torch.float16
+    raise ValueError(f'[ERROR] Unsupported SLEEP_AMP_DTYPE={config.amp_dtype}. Use bf16 or fp16.')
+
+
+def autocast_context(config):
+    if not config.use_amp or config.device.type != 'cuda':
+        return nullcontext()
+    return torch.autocast(device_type='cuda', dtype=amp_dtype_from_config(config))
+
+
+def build_grad_scaler(config):
+    use_fp16 = config.use_amp and config.device.type == 'cuda' and amp_dtype_from_config(config) is torch.float16
+    return torch.amp.GradScaler('cuda', enabled=use_fp16)
+
+
+def set_random_seed(seed=0, deterministic=False):
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = deterministic
+    torch.backends.cudnn.benchmark = not deterministic
 
 
 def print_label_distribution(labels, split_name='dataset'):
@@ -71,18 +103,20 @@ def print_label_distribution(labels, split_name='dataset'):
         print(f'  class {u}: {c} ({c / total:.6f})')
 
 
-def build_dataloader(dataset, batch_size, shuffle, num_workers=8):
+def build_dataloader(dataset, batch_size, shuffle, config, is_train=False):
     if len(dataset) == 0:
         raise ValueError('[ERROR] Cannot build DataLoader for an empty context dataset')
 
+    num_workers = config.num_workers
     return DataLoader(
         dataset=dataset,
         batch_size=batch_size,
         shuffle=shuffle,
         num_workers=num_workers,
-        pin_memory=True,
+        pin_memory=config.pin_memory,
         persistent_workers=(num_workers > 0),
-        prefetch_factor=2 if num_workers > 0 else None
+        prefetch_factor=config.prefetch_factor if num_workers > 0 else None,
+        drop_last=is_train and config.drop_last_train_batch
     )
 
 
@@ -129,45 +163,54 @@ def _context_input_shape(dataset):
 def evaluate(model, loader, criterion, config, split_name='eval', print_distribution=False):
     model.eval()
 
-    all_preds = []
-    all_labels = []
     total_loss = 0.0
+    total_correct = 0
     total_samples = 0
+    pred_counts = torch.zeros(config.num_classes, dtype=torch.long)
+    label_counts = torch.zeros(config.num_classes, dtype=torch.long)
 
-    with torch.no_grad():
+    with torch.inference_mode():
         for data, target in loader:
             data = data.to(config.device, non_blocking=True)
             target = target.to(config.device, non_blocking=True).long()
 
-            output = model(data)
-            loss = criterion(output, target)
+            with autocast_context(config):
+                output = model(data)
+                loss = criterion(output, target)
 
             batch_size = target.size(0)
             total_loss += loss.item() * batch_size
             total_samples += batch_size
 
             pred = torch.argmax(output, dim=1)
+            total_correct += (pred == target).sum().item()
 
-            all_preds.extend(pred.cpu().numpy())
-            all_labels.extend(target.cpu().numpy())
+            if print_distribution:
+                pred_counts += torch.bincount(
+                    pred.cpu(),
+                    minlength=config.num_classes
+                )[:config.num_classes]
+                label_counts += torch.bincount(
+                    target.cpu(),
+                    minlength=config.num_classes
+                )[:config.num_classes]
 
     if total_samples == 0:
         raise ValueError(f'[ERROR] Cannot evaluate empty {split_name} context loader')
 
     avg_loss = total_loss / total_samples
-    accuracy = accuracy_score(all_labels, all_preds)
+    accuracy = total_correct / total_samples
 
     if print_distribution:
-        pred_u, pred_c = np.unique(all_preds, return_counts=True)
-        label_u, label_c = np.unique(all_labels, return_counts=True)
-
         print(f'\n[{split_name}] prediction distribution:')
-        for u, c in zip(pred_u, pred_c):
-            print(f'  pred class {u}: {c} ({c / len(all_preds):.6f})')
+        for cls_idx, count in enumerate(pred_counts.tolist()):
+            if count:
+                print(f'  pred class {cls_idx}: {count} ({count / total_samples:.6f})')
 
         print(f'[{split_name}] true label distribution:')
-        for u, c in zip(label_u, label_c):
-            print(f'  true class {u}: {c} ({c / len(all_labels):.6f})')
+        for cls_idx, count in enumerate(label_counts.tolist()):
+            if count:
+                print(f'  true class {cls_idx}: {count} ({count / total_samples:.6f})')
 
     return accuracy, avg_loss
 
@@ -238,6 +281,18 @@ def build_mlflow_params(config, fold, save_all_checkpoint):
         'validation_group_fraction': config.validation_group_fraction,
         'use_positional_encoding': config.use_positional_encoding,
         'weight_decay': config.weight_decay,
+        'use_amp': config.use_amp,
+        'amp_dtype': config.amp_dtype,
+        'allow_tf32': config.allow_tf32,
+        'compile_model': config.compile_model,
+        'compile_mode': config.compile_mode,
+        'deterministic': config.deterministic,
+        'num_workers': config.num_workers,
+        'prefetch_factor': config.prefetch_factor,
+        'pin_memory': config.pin_memory,
+        'drop_last_train_batch': config.drop_last_train_batch,
+        'train_log_every_n_steps': config.train_log_every_n_steps,
+        'progress_every_n_steps': config.progress_every_n_steps,
         'early_stop_patience': config.early_stop_patience,
         'save_all_checkpoint': save_all_checkpoint,
     }
@@ -254,12 +309,25 @@ def build_mlflow_tags(fold):
 def train(save_all_checkpoint=False, start_fold=None):
     load_mlflow_env()
     config = Config()
+    configure_torch_runtime(config)
     path = Path()
 
     print(f'[INFO] device = {config.device}')
     print(f'[INFO] batch_size = {config.batch_size}')
     print(f'[INFO] learning_rate = {config.learning_rate}')
     print(f'[INFO] num_epochs = {config.num_epochs}')
+    print(
+        f'[INFO] amp={config.use_amp}, amp_dtype={config.amp_dtype}, '
+        f'allow_tf32={config.allow_tf32}, compile_model={config.compile_model}'
+    )
+    print(
+        f'[INFO] num_workers={config.num_workers}, prefetch_factor={config.prefetch_factor}, '
+        f'pin_memory={config.pin_memory}, drop_last_train_batch={config.drop_last_train_batch}'
+    )
+    print(
+        f'[INFO] train_log_every_n_steps={config.train_log_every_n_steps}, '
+        f'progress_every_n_steps={config.progress_every_n_steps}'
+    )
     print(f'[INFO] use_time = {config.use_time}')
     print(
         f'[INFO] context_left={config.context_left}, context_right={config.context_right}, '
@@ -316,7 +384,10 @@ def train(save_all_checkpoint=False, start_fold=None):
         else:
             mlflow_run_name = f'fold-{fold}'
 
-        mlflow_logger = MlflowTrainingLogger(run_name=mlflow_run_name)
+        mlflow_logger = MlflowTrainingLogger(
+            run_name=mlflow_run_name,
+            log_every_n_steps=config.train_log_every_n_steps
+        )
         mlflow_logger.start(
             params=build_mlflow_params(config, fold, save_all_checkpoint),
             tags=build_mlflow_tags(fold)
@@ -338,23 +409,28 @@ def train(save_all_checkpoint=False, start_fold=None):
                 dataset=train_set,
                 batch_size=config.batch_size,
                 shuffle=True,
-                num_workers=config.num_workers
+                config=config,
+                is_train=True
             )
             val_loader = build_dataloader(
                 dataset=val_set,
                 batch_size=config.batch_size,
                 shuffle=False,
-                num_workers=config.num_workers
+                config=config
             )
             test_loader = build_dataloader(
                 dataset=test_set,
                 batch_size=config.batch_size,
                 shuffle=False,
-                num_workers=config.num_workers
+                config=config
             )
 
             model = Transformer(config).to(config.device)
+            model_for_checkpoint = model
+            if config.compile_model:
+                model = torch.compile(model, mode=config.compile_mode)
             criterion = nn.CrossEntropyLoss()
+            grad_scaler = build_grad_scaler(config)
 
             optimizer = optim.AdamW(
                 model.parameters(),
@@ -380,50 +456,63 @@ def train(save_all_checkpoint=False, start_fold=None):
             for epoch in range(config.num_epochs):
                 model.train()
 
-                total_train_loss = 0.0
-                total_train_correct = 0
+                total_train_loss = torch.zeros((), device=config.device)
+                total_train_correct = torch.zeros((), device=config.device)
                 total_train_samples = 0
 
-                loop = tqdm(train_loader, total=len(train_loader), desc=f'Fold {fold} Epoch {epoch}')
+                loop = tqdm(
+                    train_loader,
+                    total=len(train_loader),
+                    desc=f'Fold {fold} Epoch {epoch}',
+                    mininterval=config.progress_min_interval
+                )
 
                 for data, target in loop:
                     data = data.to(config.device, non_blocking=True)
                     target = target.to(config.device, non_blocking=True).long()
 
-                    optimizer.zero_grad()
-                    output = model(data)
-                    loss = criterion(output, target)
-                    loss.backward()
-                    optimizer.step()
+                    optimizer.zero_grad(set_to_none=True)
+                    with autocast_context(config):
+                        output = model(data)
+                        loss = criterion(output, target)
+                    grad_scaler.scale(loss).backward()
+                    grad_scaler.step(optimizer)
+                    grad_scaler.update()
 
-                    pred = torch.argmax(output, dim=1)
+                    pred = torch.argmax(output.detach(), dim=1)
 
                     batch_size = target.size(0)
-                    total_train_loss += loss.item() * batch_size
-                    total_train_correct += (pred == target).sum().item()
+                    correct_batch = (pred == target).sum()
+                    total_train_loss += loss.detach() * batch_size
+                    total_train_correct += correct_batch
                     total_train_samples += batch_size
                     global_step += 1
                     global_samples_seen += batch_size
 
-                    train_acc_batch = (pred == target).float().mean().item()
-                    current_lr = optimizer.param_groups[0]['lr']
-                    mlflow_logger.log_train_step(
-                        step=global_step,
-                        epoch=epoch,
-                        loss=loss.item(),
-                        acc=train_acc_batch,
-                        lr=current_lr,
-                        samples_seen=global_samples_seen,
-                        extra_metrics={'fold': fold}
-                    )
+                    if global_step % config.train_log_every_n_steps == 0:
+                        loss_value = loss.detach().item()
+                        train_acc_batch = (correct_batch.float() / batch_size).item()
+                        current_lr = optimizer.param_groups[0]['lr']
+                        mlflow_logger.log_train_step(
+                            step=global_step,
+                            epoch=epoch,
+                            loss=loss_value,
+                            acc=train_acc_batch,
+                            lr=current_lr,
+                            samples_seen=global_samples_seen,
+                            extra_metrics={'fold': fold}
+                        )
 
-                    loop.set_postfix(
-                        loss=f'{loss.item():.4f}',
-                        train_acc=f'{train_acc_batch:.4f}'
-                    )
+                    if global_step % config.progress_every_n_steps == 0:
+                        loss_value = loss.detach().item()
+                        train_acc_batch = (correct_batch.float() / batch_size).item()
+                        loop.set_postfix(
+                            loss=f'{loss_value:.4f}',
+                            train_acc=f'{train_acc_batch:.4f}'
+                        )
 
-                train_loss = total_train_loss / total_train_samples
-                train_acc = total_train_correct / total_train_samples
+                train_loss = total_train_loss.item() / total_train_samples
+                train_acc = total_train_correct.item() / total_train_samples
 
                 need_print_dist = (epoch < 3) or (epoch % 10 == 0)
 
@@ -472,7 +561,7 @@ def train(save_all_checkpoint=False, start_fold=None):
                 val_LOSS.append(val_loss)
 
                 model_path = os.path.join(fold_dir, f'model_{fold}_epoch{epoch}.pkl')
-                checkpoint_path = early_stopping(val_acc, model, path=model_path)
+                checkpoint_path = early_stopping(val_acc, model_for_checkpoint, path=model_path)
                 if checkpoint_path:
                     mlflow_logger.log_artifact(checkpoint_path, artifact_path='checkpoints')
 
@@ -503,5 +592,5 @@ def train(save_all_checkpoint=False, start_fold=None):
 
 
 if __name__ == '__main__':
-    set_random_seed(0)
+    set_random_seed(0, deterministic=Config().deterministic)
     train(save_all_checkpoint=False, start_fold=None)

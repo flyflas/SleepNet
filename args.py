@@ -4,16 +4,47 @@ import os
 from env_utils import load_env
 
 
+def _env_bool(name, default):
+    value = os.getenv(name)
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized in ('1', 'true', 'yes', 'y', 'on'):
+        return True
+    if normalized in ('0', 'false', 'no', 'n', 'off'):
+        return False
+    return default
+
+
+def _env_int(name, default):
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
+
+
+def _env_str(name, default):
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return default
+    return value.strip()
+
+
 class Config(object):
     """args in model and trainer"""
     def __init__(self):
+        load_env()
         self.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 
         # basic training settings
         self.num_fold = 10
         self.num_classes = 5
         self.num_epochs = 45
-        self.batch_size = 96
+        self.batch_size = _env_int('SLEEP_BATCH_SIZE', 96)
         self.pad_size = 29
         self.learning_rate = 5e-5
 
@@ -45,8 +76,25 @@ class Config(object):
         self.weight_decay = 0.01
         self.grad_clip = 1.0
 
+        # throughput / runtime
+        self.use_amp = _env_bool('SLEEP_USE_AMP', torch.cuda.is_available())
+        self.amp_dtype = _env_str('SLEEP_AMP_DTYPE', 'bf16')
+        self.allow_tf32 = _env_bool('SLEEP_ALLOW_TF32', torch.cuda.is_available())
+        self.compile_model = _env_bool('SLEEP_COMPILE_MODEL', False)
+        self.compile_mode = _env_str('SLEEP_COMPILE_MODE', 'max-autotune')
+        self.deterministic = _env_bool('SLEEP_DETERMINISTIC', False)
+        self.train_log_every_n_steps = _env_int(
+            'SLEEP_TRAIN_LOG_EVERY_N_STEPS',
+            _env_int('MLFLOW_LOG_EVERY_N_STEPS', 100)
+        )
+        self.progress_every_n_steps = _env_int('SLEEP_PROGRESS_EVERY_N_STEPS', 25)
+        self.progress_min_interval = _env_int('SLEEP_PROGRESS_MIN_INTERVAL', 5)
+
         # dataloader
-        self.num_workers = 12
+        self.num_workers = _env_int('SLEEP_NUM_WORKERS', 12)
+        self.prefetch_factor = _env_int('SLEEP_PREFETCH_FACTOR', 4)
+        self.pin_memory = _env_bool('SLEEP_PIN_MEMORY', True)
+        self.drop_last_train_batch = _env_bool('SLEEP_DROP_LAST_TRAIN_BATCH', False)
         self.use_time = False
 
         # context window settings
