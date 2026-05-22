@@ -13,7 +13,7 @@ class Config(object):
         self.num_fold = 10
         self.num_classes = 5
         self.num_epochs = 45
-        self.batch_size = 512
+        self.batch_size = 96
         self.pad_size = 29
         self.learning_rate = 5e-5
 
